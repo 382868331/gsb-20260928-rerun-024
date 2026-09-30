@@ -83,9 +83,30 @@ class PlatformStore:
             raise FileNotFoundError(f"no processing versions for {action_name}/{pipeline_name}")
         return read_json(versions[-1])
 
+    def processing_version(
+        self, action_name: str, pipeline_name: str, version: str
+    ) -> ProcessingVersion:
+        path = (
+            self.processing_dir(action_name, pipeline_name)
+            / "versions"
+            / version
+            / "reconstruction.json"
+        )
+        return ProcessingVersion.from_dict(read_json(path))
+
+
     def save_report(self, action_name: str, pipeline_name: str, report: dict[str, Any]) -> Path:
         path = self.processing_dir(action_name, pipeline_name) / "evaluation_report.json"
         atomic_write_json(path, report)
+        versions = sorted(
+            (self.processing_dir(action_name, pipeline_name) / "versions").glob("v*/reconstruction.json")
+        )
+        if versions:
+            version = versions[-1].parent.name
+            snapshot_path = versions[-1].parent / "evaluation_report.json"
+            atomic_write_json(snapshot_path, report)
+            report = {**report, "report_version": version}
+            atomic_write_json(path, report)
         return path
 
     @staticmethod

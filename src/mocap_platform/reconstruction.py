@@ -4,8 +4,13 @@ import math
 from typing import Any
 
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
-from .identity import decisions_to_revisions, initial_identity_statuses
-from .identity import split_marker
+from .identity import (
+    decision_effects,
+    decisions_to_revisions,
+    initial_identity_statuses,
+    merge_decisions,
+    split_marker,
+)
 from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion
 from .skeleton import BONES, CHAIN_ARMS_LEGS, PARENTS
 
@@ -300,7 +305,18 @@ def _affected_window(revisions: list[IdentityRevision], frame_count: int) -> tup
 def _decision_window(
     decisions: list[Any], revisions: list[IdentityRevision], frame_count: int
 ) -> tuple[int, int] | None:
-    if decisions:
+    revision_decisions = [
+        decision
+        for decision in decisions
+        if decision.status == "active" or bool(decision.related_markers)
+    ]
+    if revision_decisions:
+        window_decisions = revision_decisions
+    elif decisions:
+        window_decisions = decisions
+    else:
+        window_decisions = []
+    if window_decisions:
         start = max(0, min(decision.start_frame for decision in decisions) - 2)
         end = min(frame_count - 1, max(decision.end_frame for decision in decisions) + 2)
         return start, end
@@ -322,13 +338,22 @@ def reconstruct(
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
-    decisions = decisions or []
+    supplied_decisions = decisions or []
+    decisions = (
+        merge_decisions(based_on.decisions, supplied_decisions)
+        if based_on is not None
+        else supplied_decisions
+    )
     revisions = revisions or decisions_to_revisions(decisions)
+    if based_on is not None:
+        previous_windows = based_on.parameters.get("ambiguity_windows", [])
+        ambiguity_windows = ambiguity_windows or previous_windows
     ambiguity_windows = ambiguity_windows or []
     corrected, changed = remap_identities(observations, revisions)
     identity_statuses = initial_identity_statuses(
         observations, ambiguity_windows, decisions
     )
+    effects = decision_effects(decisions, ambiguity_windows, len(observations))
 
     decision_window = _decision_window(decisions, revisions, len(observations))
     if based_on is not None and decision_window is not None:
@@ -379,6 +404,7 @@ def reconstruct(
         revisions=revisions,
         decisions=decisions,
         identity_statuses=identity_statuses,
+        decision_effects=effects,
         based_on=based_on.version if based_on else None,
     )
 

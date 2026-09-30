@@ -98,6 +98,24 @@ class IdentityDecision:
     status: Literal["active", "revoked"] = "active"
     created_at: str = field(default_factory=utc_now)
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "IdentityDecision":
+        allowed = {
+            "decision_id",
+            "person_id",
+            "marker",
+            "start_frame",
+            "end_frame",
+            "decision",
+            "alternative_person_id",
+            "reason",
+            "related_markers",
+            "alternative_related_markers",
+            "status",
+            "created_at",
+        }
+        return cls(**{key: value[key] for key in allowed if key in value})
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "decision_id": self.decision_id,
@@ -116,7 +134,7 @@ class IdentityDecision:
 
 
 MarkerStatus = Literal["observed", "recovered", "uncertain", "missing"]
-IdentityStatus = Literal["certain", "confirmed", "ambiguous"]
+IdentityStatus = Literal["certain", "confirmed", "denied", "ambiguous", "conflicted"]
 
 
 @dataclass
@@ -132,8 +150,31 @@ class ProcessingVersion:
     revisions: list[IdentityRevision] = field(default_factory=list)
     decisions: list[IdentityDecision] = field(default_factory=list)
     identity_statuses: list[dict[str, IdentityStatus]] = field(default_factory=list)
+    decision_effects: list[dict[str, Any]] = field(default_factory=list)
     based_on: str | None = None
     created_at: str = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ProcessingVersion":
+        return cls(
+            action_name=value["action_name"],
+            pipeline_name=value["pipeline_name"],
+            version=value["version"],
+            capture_id=value["capture_id"],
+            calibration_version=value["calibration_version"],
+            parameters=value.get("parameters", {}),
+            frames=value["frames"],
+            statuses=value["statuses"],
+            revisions=[IdentityRevision(**item) for item in value.get("identity_revisions", [])],
+            decisions=[
+                IdentityDecision.from_dict(item)
+                for item in value.get("identity_decisions", [])
+            ],
+            identity_statuses=value.get("identity_statuses", []),
+            decision_effects=value.get("decision_effects", []),
+            based_on=value.get("based_on"),
+            created_at=value.get("created_at", utc_now()),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +189,7 @@ class ProcessingVersion:
             "parameters": self.parameters,
             "identity_revisions": [revision.to_dict() for revision in self.revisions],
             "identity_decisions": [decision.to_dict() for decision in self.decisions],
+            "decision_effects": self.decision_effects,
             "frames": self.frames,
             "statuses": self.statuses,
             "identity_statuses": self.identity_statuses,

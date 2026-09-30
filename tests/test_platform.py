@@ -7,7 +7,9 @@ from pathlib import Path
 
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
-from mocap_platform.models import IdentityDecision, IdentityRevision
+from mocap_platform.identity import decision_effects, initial_identity_statuses
+from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
+from mocap_platform.models import ProcessingVersion
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -18,6 +20,115 @@ from mocap_platform.synthetic_multi import (
 
 
 class PlatformIntegrationTest(unittest.TestCase):
+    def test_decision_scope_conflicts_revocation_and_reopen_review(self) -> None:
+        markers = [
+            "p0_l_wrist",
+            "p0_r_ankle",
+            "p1_r_wrist",
+            "p1_l_ankle",
+        ]
+        frames = [{marker: [0.0, 0.0, 0.0] for marker in markers} for _ in range(30)]
+        ankle_window = {
+            "id": "ankle-crossing",
+            "start_frame": 10,
+            "end_frame": 12,
+            "markers": ["p0_r_ankle", "p1_l_ankle"],
+        }
+        wrist_window = {
+            "id": "wrist-reappearance",
+            "start_frame": 20,
+            "end_frame": 22,
+            "markers": ["p0_l_wrist", "p1_r_wrist"],
+        }
+        adjacent_window = {
+            "id": "adjacent-ankle",
+            "start_frame": 13,
+            "end_frame": 14,
+            "markers": ["p0_r_ankle", "p1_l_ankle"],
+        }
+        ankle_confirmation = IdentityDecision(
+            decision_id="confirm-ankle",
+            person_id="p0",
+            marker="r_ankle",
+            start_frame=10,
+            end_frame=12,
+            decision="confirm",
+            alternative_person_id="p1",
+            related_markers=["r_ankle"],
+            alternative_related_markers=["l_ankle"],
+            reason="right ankle segment only",
+        )
+        statuses = initial_identity_statuses(
+            frames,
+            [ankle_window, wrist_window, adjacent_window],
+            [ankle_confirmation],
+        )
+        self.assertEqual(statuses[11]["p0_r_ankle"], "confirmed")
+        self.assertEqual(statuses[11]["p1_l_ankle"], "confirmed")
+        self.assertEqual(statuses[21]["p0_l_wrist"], "ambiguous")
+        self.assertEqual(statuses[21]["p1_r_wrist"], "ambiguous")
+        self.assertEqual(statuses[13]["p0_r_ankle"], "ambiguous")
+
+        first_wrist = IdentityDecision(
+            decision_id="confirm-wrist-p0",
+            person_id="p0",
+            marker="l_wrist",
+            start_frame=20,
+            end_frame=22,
+            decision="confirm",
+            alternative_person_id="p1",
+            related_markers=["l_wrist"],
+            alternative_related_markers=["r_wrist"],
+            reason="first reviewer",
+        )
+        second_wrist = IdentityDecision(
+            decision_id="confirm-wrist-p1",
+            person_id="p0",
+            marker="l_wrist",
+            start_frame=20,
+            end_frame=22,
+            decision="deny",
+            alternative_person_id="p1",
+            related_markers=["l_wrist"],
+            alternative_related_markers=["r_wrist"],
+            reason="conflicting reviewer rejects p0 ownership",
+        )
+        statuses = initial_identity_statuses(
+            frames,
+            [ankle_window, wrist_window],
+            [ankle_confirmation, first_wrist, second_wrist],
+        )
+        self.assertEqual(statuses[21]["p0_l_wrist"], "conflicted")
+        self.assertEqual(statuses[11]["p0_r_ankle"], "confirmed")
+        effects = decision_effects(
+            [ankle_confirmation, first_wrist, second_wrist],
+            [ankle_window, wrist_window],
+            len(frames),
+        )
+        wrist_effects = [item for item in effects if item["decision_id"] == "confirm-wrist-p0"][0]
+        self.assertTrue(wrist_effects["conflicted"])
+        self.assertEqual(wrist_effects["frame_ranges"], [{"start_frame": 20, "end_frame": 22}])
+        self.assertEqual(
+            wrist_effects["affected_trajectories"],
+            [
+                {"marker": "p0_l_wrist", "owner_person_id": "p0"},
+                {"marker": "p1_r_wrist", "owner_person_id": "p1"},
+            ],
+        )
+
+        revoked_ankle = IdentityDecision.from_dict(
+            {**ankle_confirmation.to_dict(), "status": "revoked"}
+        )
+        reopened_statuses = initial_identity_statuses(
+            frames, [ankle_window, wrist_window], [revoked_ankle]
+        )
+        self.assertEqual(reopened_statuses[11]["p0_r_ankle"], "ambiguous")
+        self.assertEqual(reopened_statuses[21]["p0_l_wrist"], "ambiguous")
+        reopened_effect = decision_effects(
+            [revoked_ankle], [ankle_window, wrist_window], len(frames)
+        )[0]
+        self.assertEqual(len(reopened_effect["reopened_ambiguity_keys"]), 6)
+
     def test_versioned_recovery_identity_revision_and_long_gap(self) -> None:
         truth = generate_known_action()
         observed, _events = inject_occlusions_and_swaps(truth)
@@ -191,6 +302,42 @@ class PlatformIntegrationTest(unittest.TestCase):
                 metrics[2]["ambiguous_identity_marker_frames"],
                 metrics[0]["ambiguous_identity_marker_frames"],
             )
+
+            reopened_v3 = store.processing_version(action, pipeline, "v003")
+            recalibrated_decision = IdentityDecision.from_dict(
+                {
+                    **v2["identity_decisions"][0],
+                    "status": "active",
+                    "decision_id": "recrossing-confirmation-v004",
+                }
+            )
+            multi_v4 = reconstruct(
+                action,
+                pipeline,
+                capture["capture_id"],
+                observed,
+                store.load_calibration(capture["capture_id"]),
+                decisions=[recalibrated_decision],
+                ambiguity_windows=ambiguity_windows,
+                based_on=reopened_v3,
+            )
+            self.assertEqual(multi_v4.version, "v004")
+            self.assertEqual(multi_v4.based_on, "v003")
+            self.assertEqual(len(multi_v4.decisions), 2)
+            self.assertEqual(multi_v4.identity_statuses[20]["p0_l_wrist"], "confirmed")
+            self.assertEqual(multi_v4.identity_statuses[40]["p0_l_wrist"], "ambiguous")
+            store.save_processing(multi_v4)
+            with self.assertRaises(FileExistsError):
+                store.save_capture(
+                    CaptureRecord(
+                        capture_id=capture["capture_id"],
+                        action_name=action,
+                        frame_count=0,
+                        frame_rate=30.0,
+                        markers=[],
+                        observed_frames=[],
+                    )
+                )
 
 
 if __name__ == "__main__":

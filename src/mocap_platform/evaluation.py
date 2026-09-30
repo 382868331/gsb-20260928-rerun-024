@@ -32,7 +32,7 @@ def evaluate(processing: dict[str, Any], ground_truth: list[dict[str, Any]]) -> 
                 identity_status = None
                 if processing.get("identity_statuses"):
                     identity_status = processing["identity_statuses"][frame_index].get(marker)
-                if identity_status == "ambiguous":
+                if identity_status in {"ambiguous", "conflicted"}:
                     continue
                 error = distance(reconstructed, actual)
                 if error > 0.02:
@@ -112,6 +112,7 @@ def _identity_continuity_rmse(
 ) -> float | None:
     errors: list[float] = []
     identity_statuses = processing.get("identity_statuses", [])
+    unresolved = {"ambiguous", "conflicted"}
     for person_id in people:
         joints = JOINTS if person_id is not None else list(ground_truth[0])
         for joint_name in joints:
@@ -124,9 +125,9 @@ def _identity_continuity_rmse(
                 if None in (current, previous, truth_current, truth_previous):
                     continue
                 if identity_statuses:
-                    if identity_statuses[frame_index].get(marker) == "ambiguous":
+                    if identity_statuses[frame_index].get(marker) in unresolved:
                         continue
-                    if identity_statuses[frame_index - 1].get(marker) == "ambiguous":
+                    if identity_statuses[frame_index - 1].get(marker) in unresolved:
                         continue
                 actual_delta = distance(current, previous)
                 expected_delta = distance(truth_current, truth_previous)
@@ -142,8 +143,9 @@ def evaluate_multi_person(
     summary = evaluate(processing, ground_truth)
     people = _people(ground_truth)
     identity_statuses = processing.get("identity_statuses", [])
+    unresolved = {"ambiguous", "conflicted"}
     ambiguous = sum(
-        sum(status == "ambiguous" for status in frame.values()) for frame in identity_statuses
+        sum(status in unresolved for status in frame.values()) for frame in identity_statuses
     )
     bone_errors = _bone_length_errors(processing, ground_truth)
     contact_frames = _contact_frames(processing["frames"], people)
