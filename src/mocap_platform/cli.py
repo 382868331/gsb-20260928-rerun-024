@@ -9,6 +9,7 @@ from .models import Calibration, CaptureRecord, IdentityDecision, IdentityRevisi
 from .synthetic_multi import (
     generate_multi_person_action,
     inject_multi_person_crossing,
+    inject_scoped_review_events,
     multi_person_markers,
 )
 from .reconstruction import reconstruct
@@ -206,6 +207,163 @@ def demo(output: str) -> None:
         f"{multi_report['comparison']['versions'][1]['metrics']['bone_length_rmse']:.6f}/"
         f"{multi_report['comparison']['versions'][2]['metrics']['bone_length_rmse']:.6f}"
     )
+
+    scoped_pipeline = "scoped_confirmation_review"
+    scoped_capture_id = "demo_capture_0003"
+
+    scoped_truth = generate_multi_person_action()
+    scoped_observed, scoped_events, scoped_windows = inject_scoped_review_events(
+        scoped_truth
+    )
+    scoped_capture = CaptureRecord(
+        capture_id=scoped_capture_id,
+        action_name=action_name,
+        frame_count=len(scoped_observed),
+        frame_rate=30.0,
+        markers=multi_person_markers(),
+        observed_frames=scoped_observed,
+        ground_truth_frames=scoped_truth,
+        source="synthetic_known_multi_person_action",
+        notes="Arm crossing, short right-ankle swap with local occlusion, and reappearance ambiguity.",
+    )
+    store.save_capture(scoped_capture)
+
+    scoped_bone_lengths, scoped_joint_limits = calibrate_from_action(scoped_truth)
+    scoped_calibration = Calibration(
+        calibration_id="calibration_demo_0003",
+        capture_id=scoped_capture_id,
+        bone_lengths=scoped_bone_lengths,
+        joint_limits=scoped_joint_limits,
+    )
+    store.save_calibration(scoped_calibration)
+    scoped_calibration_dict = scoped_calibration.to_dict()
+
+    scoped_v1 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        ambiguity_windows=scoped_windows,
+    )
+    store.save_processing(scoped_v1)
+
+    ankle_confirmation = IdentityDecision(
+        decision_id="decision_001_confirm_p0_right_ankle",
+        person_id="p0",
+        marker="r_ankle",
+        start_frame=25,
+        end_frame=29,
+        decision="confirm",
+        alternative_person_id="p1",
+        reason="manual review confirms the right ankle track belongs to p0",
+    )
+    store.save_decision(action_name, scoped_pipeline, ankle_confirmation)
+    scoped_v2 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[ankle_confirmation],
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v1,
+    )
+    store.save_processing(scoped_v2)
+
+    arm_confirmation = IdentityDecision(
+        decision_id="decision_002_confirm_p0_left_arm",
+        person_id="p0",
+        marker="l_wrist",
+        start_frame=20,
+        end_frame=24,
+        decision="confirm",
+        alternative_person_id="p1",
+        reason="manual review confirms the left arm track belongs to p0 for the first crossing half",
+        related_markers=["l_shoulder", "l_elbow", "l_wrist"],
+        alternative_related_markers=["r_shoulder", "r_elbow", "r_wrist"],
+    )
+    store.save_decision(action_name, scoped_pipeline, arm_confirmation)
+    scoped_v3 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[ankle_confirmation, arm_confirmation],
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v2,
+    )
+    store.save_processing(scoped_v3)
+
+    conflicting_deny = IdentityDecision(
+        decision_id="decision_003_deny_p0_left_wrist",
+        person_id="p0",
+        marker="l_wrist",
+        start_frame=22,
+        end_frame=26,
+        decision="deny",
+        alternative_person_id="p1",
+        reason="conflicting review claims the wrist track does not belong to p0",
+    )
+    store.save_decision(action_name, scoped_pipeline, conflicting_deny)
+    scoped_v4 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[ankle_confirmation, arm_confirmation, conflicting_deny],
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v3,
+    )
+    store.save_processing(scoped_v4)
+
+    store.revoke_decision(
+        action_name,
+        scoped_pipeline,
+        ankle_confirmation.decision_id,
+        reason="reviewer withdrew the ankle confirmation",
+    )
+    reloaded_decisions = [
+        IdentityDecision(**data)
+        for data in store.load_decisions(action_name, scoped_pipeline)
+    ]
+    scoped_v5 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=reloaded_decisions,
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v4,
+    )
+    store.save_processing(scoped_v5)
+
+    scoped_versions = [
+        scoped_v1.to_dict(),
+        scoped_v2.to_dict(),
+        scoped_v3.to_dict(),
+        scoped_v4.to_dict(),
+        scoped_v5.to_dict(),
+    ]
+    scoped_report = {
+        "capture_id": scoped_capture_id,
+        "injected_events": scoped_events,
+        "comparison": compare_identity_revisions(scoped_versions, scoped_truth),
+        "decision_review": {
+            "decision_impacts": scoped_v5.parameters["decision_impacts"],
+            "decision_conflicts": scoped_v5.parameters["decision_conflicts"],
+            "restored_ambiguities": scoped_v5.parameters["restored_ambiguities"],
+        },
+    }
+    store.save_report(action_name, scoped_pipeline, scoped_report)
+    scoped_metrics = [
+        item["metrics"]["ambiguous_identity_marker_frames"]
+        for item in scoped_report["comparison"]["versions"]
+    ]
+    print(f"scoped v1..v5 ambiguous marker frames={scoped_metrics}")
 
 
 def main() -> None:

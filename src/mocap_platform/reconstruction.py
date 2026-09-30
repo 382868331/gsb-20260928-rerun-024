@@ -4,7 +4,13 @@ import math
 from typing import Any
 
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
-from .identity import decisions_to_revisions, initial_identity_statuses
+from .identity import (
+    decision_affected_markers,
+    decision_trajectories,
+    decisions_to_revisions,
+    initial_identity_statuses,
+    resolve_decisions,
+)
 from .identity import split_marker
 from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion
 from .skeleton import BONES, CHAIN_ARMS_LEGS, PARENTS
@@ -309,6 +315,72 @@ def _decision_window(
     return None
 
 
+def _decision_impacts(
+    decisions: list[Any], conflicts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    conflicted = {conflict["decision_id"] for conflict in conflicts}
+    impacts = []
+    for decision in decisions:
+        if decision.status == "revoked":
+            state = "revoked"
+        elif decision.decision_id in conflicted:
+            state = "conflict"
+        else:
+            state = "applied"
+        impacts.append(
+            {
+                "decision_id": decision.decision_id,
+                "decision": decision.decision,
+                "status": state,
+                "trajectories": decision_trajectories(decision),
+            }
+        )
+    return impacts
+
+
+def _decision_windows(decisions: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "decision_id": decision.decision_id,
+            "start_frame": decision.start_frame,
+            "end_frame": decision.end_frame,
+            "markers": sorted(decision_affected_markers(decision)),
+        }
+        for decision in decisions
+        if decision.status == "active"
+    ]
+
+
+def _restored_ambiguities(
+    previous: list[dict[str, str]], current: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    if not previous:
+        return []
+    markers = sorted({marker for frame in current for marker in frame})
+    restored: list[dict[str, Any]] = []
+    for marker in markers:
+        start: int | None = None
+        for frame_index in range(len(current)):
+            before = previous[frame_index].get(marker) if frame_index < len(previous) else None
+            is_restored = (
+                current[frame_index].get(marker) == "ambiguous"
+                and before is not None
+                and before != "ambiguous"
+            )
+            if is_restored and start is None:
+                start = frame_index
+            elif not is_restored and start is not None:
+                restored.append(
+                    {"marker": marker, "start_frame": start, "end_frame": frame_index - 1}
+                )
+                start = None
+        if start is not None:
+            restored.append(
+                {"marker": marker, "start_frame": start, "end_frame": len(current) - 1}
+            )
+    return restored
+
+
 def reconstruct(
     action_name: str,
     pipeline_name: str,
@@ -325,10 +397,16 @@ def reconstruct(
     decisions = decisions or []
     revisions = revisions or decisions_to_revisions(decisions)
     ambiguity_windows = ambiguity_windows or []
+    _accepted, conflicts = resolve_decisions(decisions)
     corrected, changed = remap_identities(observations, revisions)
     identity_statuses = initial_identity_statuses(
         observations, ambiguity_windows, decisions
     )
+    decision_parameters = {
+        "decision_impacts": _decision_impacts(decisions, conflicts),
+        "decision_conflicts": conflicts,
+        "decision_windows": _decision_windows(decisions),
+    }
 
     decision_window = _decision_window(decisions, revisions, len(observations))
     if based_on is not None and decision_window is not None:
@@ -358,13 +436,22 @@ def reconstruct(
             "recompute_window": {"start_frame": start, "end_frame": end},
             "changed_frames": [i for i, value in enumerate(changed) if value],
             "ambiguity_windows": ambiguity_windows,
+            "restored_ambiguities": _restored_ambiguities(
+                based_on.identity_statuses, identity_statuses
+            ),
+            **decision_parameters,
         }
         version = _next_version(based_on.version)
     else:
         frames, statuses = interpolate_gaps(corrected, max_gap_frames)
         frames, statuses = apply_skeleton_constraints(frames, statuses, calibration)
-        parameters = {"max_gap_frames": max_gap_frames, "recompute_window": None}
-        parameters["ambiguity_windows"] = ambiguity_windows
+        parameters = {
+            "max_gap_frames": max_gap_frames,
+            "recompute_window": None,
+            "ambiguity_windows": ambiguity_windows,
+            "restored_ambiguities": [],
+            **decision_parameters,
+        }
         version = "v001"
 
     return ProcessingVersion(

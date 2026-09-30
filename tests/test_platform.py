@@ -7,7 +7,7 @@ from pathlib import Path
 
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
-from mocap_platform.models import IdentityDecision, IdentityRevision
+from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -18,6 +18,122 @@ from mocap_platform.synthetic_multi import (
 
 
 class PlatformIntegrationTest(unittest.TestCase):
+    def test_scoped_confirmation_conflicts_revocation_and_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "scoped_confirmation_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v1, v2, v3, v4, v5 = (load(v) for v in ("v001", "v002", "v003", "v004", "v005"))
+            truth = store.load_capture("demo_capture_0003")["ground_truth"]
+
+            # A decision only resolves its own markers and frame range.
+            self.assertEqual(v1["identity_statuses"][26]["p0_r_ankle"], "ambiguous")
+            self.assertEqual(v2["identity_statuses"][26]["p0_r_ankle"], "confirmed")
+            self.assertEqual(v2["frames"][26]["p0_r_ankle"], truth[26]["p0_r_ankle"])
+            # Other markers in an overlapping window stay ambiguous.
+            self.assertEqual(v2["identity_statuses"][26]["p0_l_wrist"], "ambiguous")
+            # Same markers in another time range stay ambiguous.
+            self.assertEqual(v2["identity_statuses"][41]["p0_l_wrist"], "ambiguous")
+            # The ankle window outside the decision range keeps its ambiguity.
+            self.assertEqual(v3["identity_statuses"][22]["p0_l_wrist"], "confirmed")
+            self.assertEqual(v3["identity_statuses"][26]["p0_l_wrist"], "ambiguous")
+            self.assertEqual(v3["identity_statuses"][41]["p0_l_wrist"], "ambiguous")
+
+            # Adjacent confirmation windows keep separate, exact ranges.
+            windows = {
+                item["decision_id"]: (item["start_frame"], item["end_frame"])
+                for item in v3["parameters"]["decision_windows"]
+            }
+            self.assertEqual(
+                windows,
+                {
+                    "decision_001_confirm_p0_right_ankle": (25, 29),
+                    "decision_002_confirm_p0_left_arm": (20, 24),
+                },
+            )
+
+            # Conflicting decisions are itemized; the earlier one stays applied.
+            conflicts = v4["parameters"]["decision_conflicts"]
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0]["decision_id"], "decision_003_deny_p0_left_wrist")
+            self.assertEqual(conflicts[0]["conflicts_with"], "decision_002_confirm_p0_left_arm")
+            self.assertEqual((conflicts[0]["start_frame"], conflicts[0]["end_frame"]), (22, 24))
+            impacts = {
+                item["decision_id"]: item["status"]
+                for item in v4["parameters"]["decision_impacts"]
+            }
+            self.assertEqual(impacts["decision_001_confirm_p0_right_ankle"], "applied")
+            self.assertEqual(impacts["decision_002_confirm_p0_left_arm"], "applied")
+            self.assertEqual(impacts["decision_003_deny_p0_left_wrist"], "conflict")
+            self.assertTrue(
+                all(item["trajectories"] for item in v4["parameters"]["decision_impacts"])
+            )
+            self.assertEqual(v4["frames"][23]["p0_l_wrist"], truth[23]["p0_l_wrist"])
+            self.assertEqual(v4["frames"], v3["frames"])
+
+            # Revoking one decision restores only its own ambiguity.
+            self.assertEqual(v5["identity_statuses"][26]["p0_r_ankle"], "ambiguous")
+            self.assertEqual(v5["identity_statuses"][22]["p0_l_wrist"], "confirmed")
+            restored = v5["parameters"]["restored_ambiguities"]
+            self.assertEqual(
+                restored,
+                [
+                    {"marker": "p0_r_ankle", "start_frame": 25, "end_frame": 29},
+                    {"marker": "p1_r_ankle", "start_frame": 25, "end_frame": 29},
+                ],
+            )
+            self.assertEqual(v5["version"], "v005")
+            self.assertEqual(v5["based_on"], "v004")
+
+            # Decisions persist immutably and reload for continued review.
+            decisions = store.load_decisions(action, pipeline)
+            self.assertEqual(len(decisions), 3)
+            statuses = {item["decision_id"]: item["status"] for item in decisions}
+            self.assertEqual(statuses["decision_001_confirm_p0_right_ankle"], "revoked")
+            self.assertEqual(statuses["decision_002_confirm_p0_left_arm"], "active")
+            with self.assertRaises(FileExistsError):
+                store.save_decision(
+                    action,
+                    pipeline,
+                    IdentityDecision(
+                        decision_id="decision_002_confirm_p0_left_arm",
+                        person_id="p0",
+                        marker="l_wrist",
+                        start_frame=20,
+                        end_frame=24,
+                        decision="deny",
+                        alternative_person_id="p1",
+                        reason="attempted overwrite",
+                    ),
+                )
+            with self.assertRaises(FileExistsError):
+                store.revoke_decision(
+                    action, pipeline, "decision_001_confirm_p0_right_ankle"
+                )
+            with self.assertRaises(FileNotFoundError):
+                store.revoke_decision(action, pipeline, "decision_999_missing")
+            with self.assertRaises(FileExistsError):
+                store.save_capture(
+                    CaptureRecord(
+                        capture_id="demo_capture_0003",
+                        action_name=action,
+                        frame_count=1,
+                        frame_rate=30.0,
+                        markers=[],
+                        observed_frames=[],
+                    )
+                )
+
     def test_versioned_recovery_identity_revision_and_long_gap(self) -> None:
         truth = generate_known_action()
         observed, _events = inject_occlusions_and_swaps(truth)

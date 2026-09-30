@@ -146,3 +146,94 @@ def inject_multi_person_crossing(
 
 def multi_person_markers() -> list[str]:
     return [person_marker(person_id, joint) for person_id in PERSON_IDS for joint in JOINTS]
+
+
+ANKLE_SWAP_START = 25
+ANKLE_SWAP_END = 29
+
+
+def inject_scoped_review_events(
+    truth: list[dict[str, list[float]]],
+) -> tuple[list[dict[str, list[float] | None]], list[dict[str, Any]], list[dict[str, Any]]]:
+    observed: list[dict[str, list[float] | None]] = copy.deepcopy(truth)
+    events: list[dict[str, Any]] = []
+
+    for frame_index in range(CROSSING_START, CROSSING_END + 1):
+        for left_joint, right_joint in zip(ARM_MARKERS, OPPOSITE_ARM_MARKERS):
+            first = person_marker("p0", left_joint)
+            second = person_marker("p1", right_joint)
+            observed[frame_index][first], observed[frame_index][second] = (
+                observed[frame_index][second],
+                observed[frame_index][first],
+            )
+    events.append(
+        {
+            "type": "identity_swap",
+            "markers": [
+                *[person_marker("p0", marker) for marker in ARM_MARKERS],
+                *[person_marker("p1", marker) for marker in OPPOSITE_ARM_MARKERS],
+            ],
+            "start_frame": CROSSING_START,
+            "end_frame": CROSSING_END,
+        }
+    )
+
+    for frame_index in range(ANKLE_SWAP_START, ANKLE_SWAP_END + 1):
+        first = person_marker("p0", "r_ankle")
+        second = person_marker("p1", "r_ankle")
+        observed[frame_index][first], observed[frame_index][second] = (
+            observed[frame_index][second],
+            observed[frame_index][first],
+        )
+    events.append(
+        {
+            "type": "identity_swap",
+            "markers": [person_marker("p0", "r_ankle"), person_marker("p1", "r_ankle")],
+            "start_frame": ANKLE_SWAP_START,
+            "end_frame": ANKLE_SWAP_END,
+        }
+    )
+
+    for frame_index in range(27, 29):
+        observed[frame_index][person_marker("p0", "r_ankle")] = None
+    events.append(
+        {
+            "type": "local_occlusion",
+            "marker": person_marker("p0", "r_ankle"),
+            "start_frame": 27,
+            "end_frame": 28,
+        }
+    )
+
+    ambiguity_windows = [
+        {
+            "start_frame": CROSSING_START,
+            "end_frame": CROSSING_END,
+            "markers": [
+                *[person_marker("p0", marker) for marker in ARM_MARKERS],
+                *[person_marker("p1", marker) for marker in OPPOSITE_ARM_MARKERS],
+            ],
+            "reason": "two nearby people make both arm assignments plausible",
+        },
+        {
+            "start_frame": ANKLE_SWAP_START,
+            "end_frame": ANKLE_SWAP_END,
+            "markers": [person_marker("p0", "r_ankle"), person_marker("p1", "r_ankle")],
+            "reason": "right ankle tracks cross while people pass each other",
+        },
+        {
+            "start_frame": REAPPEARANCE_START,
+            "end_frame": REAPPEARANCE_END,
+            "markers": [person_marker("p0", "l_wrist"), person_marker("p1", "r_wrist")],
+            "reason": "reappearing wrist tracks have two plausible owners",
+        },
+    ]
+    events.append(
+        {
+            "type": "equivocal_reappearance",
+            "markers": ambiguity_windows[2]["markers"],
+            "start_frame": REAPPEARANCE_START,
+            "end_frame": REAPPEARANCE_END,
+        }
+    )
+    return observed, events, ambiguity_windows

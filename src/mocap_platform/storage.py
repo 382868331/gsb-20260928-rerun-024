@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .models import Calibration, CaptureRecord, ProcessingVersion
+from .models import Calibration, CaptureRecord, IdentityDecision, ProcessingVersion
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -87,6 +87,63 @@ class PlatformStore:
         path = self.processing_dir(action_name, pipeline_name) / "evaluation_report.json"
         atomic_write_json(path, report)
         return path
+
+    def decisions_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "decisions"
+
+    def save_decision(
+        self, action_name: str, pipeline_name: str, decision: IdentityDecision
+    ) -> Path:
+        path = self.decisions_dir(action_name, pipeline_name) / f"{decision.decision_id}.json"
+        if path.exists():
+            raise FileExistsError(f"decision is immutable and already exists: {path}")
+        atomic_write_json(path, decision.to_dict())
+        return path
+
+    def revoke_decision(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        decision_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.decisions_dir(action_name, pipeline_name)
+        decision_path = directory / f"{decision_id}.json"
+        if not decision_path.exists():
+            raise FileNotFoundError(f"cannot revoke unknown decision: {decision_path}")
+        path = directory / f"{decision_id}.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"decision already revoked: {path}")
+        from .models import utc_now
+
+        atomic_write_json(
+            path,
+            {
+                "kind": "decision_revocation",
+                "decision_id": decision_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_decisions(self, action_name: str, pipeline_name: str) -> list[dict[str, Any]]:
+        directory = self.decisions_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".revocation.json")]
+            for path in directory.glob("*.revocation.json")
+        }
+        decisions: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".revocation.json"):
+                continue
+            data = read_json(path)
+            if data["decision_id"] in revoked:
+                data["status"] = "revoked"
+            decisions.append(data)
+        return decisions
 
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:

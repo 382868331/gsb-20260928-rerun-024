@@ -39,20 +39,101 @@ def kinematic_group(joint_name: str) -> list[str]:
     return [joint_name]
 
 
+def decision_joint_groups(decision: IdentityDecision) -> tuple[list[str], list[str]]:
+    group = decision.related_markers or kinematic_group(decision.marker)
+    alternative_group = (
+        decision.alternative_related_markers
+        or decision.related_markers
+        or kinematic_group(decision.marker)
+    )
+    return group, alternative_group
+
+
+def decision_affected_markers(decision: IdentityDecision) -> set[str]:
+    group, alternative_group = decision_joint_groups(decision)
+    return {
+        person_marker(decision.person_id, joint_name) for joint_name in group
+    } | {
+        person_marker(decision.alternative_person_id, joint_name)
+        for joint_name in alternative_group
+    }
+
+
+def decision_trajectories(decision: IdentityDecision) -> list[dict[str, Any]]:
+    return [
+        {
+            "marker": marker,
+            "start_frame": decision.start_frame,
+            "end_frame": decision.end_frame,
+        }
+        for marker in sorted(decision_affected_markers(decision))
+    ]
+
+
+def _frames_overlap(first: IdentityDecision, second: IdentityDecision) -> bool:
+    return (
+        first.start_frame <= second.end_frame
+        and second.start_frame <= first.end_frame
+    )
+
+
+def decisions_conflict(first: IdentityDecision, second: IdentityDecision) -> bool:
+    if not _frames_overlap(first, second):
+        return False
+    if not decision_affected_markers(first) & decision_affected_markers(second):
+        return False
+    return (
+        first.decision != second.decision
+        or first.person_id != second.person_id
+        or first.alternative_person_id != second.alternative_person_id
+    )
+
+
+def resolve_decisions(
+    decisions: list[IdentityDecision],
+) -> tuple[list[IdentityDecision], list[dict[str, Any]]]:
+    active = sorted(
+        (decision for decision in decisions if decision.status == "active"),
+        key=lambda decision: (decision.created_at, decision.decision_id),
+    )
+    accepted: list[IdentityDecision] = []
+    conflicts: list[dict[str, Any]] = []
+    for decision in active:
+        blocker = next(
+            (other for other in accepted if decisions_conflict(decision, other)),
+            None,
+        )
+        if blocker is None:
+            accepted.append(decision)
+            continue
+        shared = decision_affected_markers(decision) & decision_affected_markers(blocker)
+        conflicts.append(
+            {
+                "decision_id": decision.decision_id,
+                "conflicts_with": blocker.decision_id,
+                "start_frame": max(decision.start_frame, blocker.start_frame),
+                "end_frame": min(decision.end_frame, blocker.end_frame),
+                "markers": sorted(shared),
+                "decision_trajectories": decision_trajectories(decision),
+                "conflicts_with_trajectories": decision_trajectories(blocker),
+                "reason": (
+                    "overlapping manual decisions disagree; the earlier "
+                    "decision is kept and this one is not applied"
+                ),
+            }
+        )
+    return accepted, conflicts
+
+
 def decisions_to_revisions(
     decisions: list[IdentityDecision],
 ) -> list[IdentityRevision]:
-    active = [decision for decision in decisions if decision.status == "active"]
+    active, _conflicts = resolve_decisions(decisions)
     pairs: set[tuple[str, str, int, int]] = set()
     revisions: list[IdentityRevision] = []
 
     for decision in active:
-        group = decision.related_markers or kinematic_group(decision.marker)
-        alternative_group = (
-            decision.alternative_related_markers
-            if decision.alternative_related_markers
-            else group
-        )
+        group, alternative_group = decision_joint_groups(decision)
         for joint_name, alternative_joint_name in zip(group, alternative_group):
             source = person_marker(decision.person_id, joint_name)
             target = person_marker(decision.alternative_person_id, alternative_joint_name)
@@ -95,17 +176,12 @@ def decision_window(decisions: list[IdentityDecision], frame_count: int) -> tupl
     )
 
 
-def ambiguity_markers(window: dict[str, Any], decisions: list[IdentityDecision]) -> set[str]:
-    active = [
-        decision
-        for decision in decisions
-        if decision.status == "active"
-        and decision.start_frame <= window["end_frame"]
-        and decision.end_frame >= window["start_frame"]
-    ]
-    if active:
-        return set()
-    return set(window.get("markers", []))
+def cleared_markers_at(decisions: list[IdentityDecision], frame_index: int) -> set[str]:
+    cleared: set[str] = set()
+    for decision in decisions:
+        if decision.start_frame <= frame_index <= decision.end_frame:
+            cleared |= decision_affected_markers(decision)
+    return cleared
 
 
 def initial_identity_statuses(
@@ -116,34 +192,23 @@ def initial_identity_statuses(
     markers = sorted({marker for frame in frames for marker in frame})
     statuses = [{marker: "certain" for marker in markers} for _ in frames]
     decisions = decisions or []
+    accepted, _conflicts = resolve_decisions(decisions)
     for window in ambiguity_windows:
-        affected = ambiguity_markers(window, decisions)
         for frame_index in range(window["start_frame"], window["end_frame"] + 1):
-            for marker in affected:
+            if not 0 <= frame_index < len(statuses):
+                continue
+            cleared = cleared_markers_at(accepted, frame_index)
+            for marker in window.get("markers", []):
+                if marker in cleared:
+                    continue
                 if marker in statuses[frame_index]:
                     statuses[frame_index][marker] = "ambiguous"
     confirmed = {
         frame_index: set()
         for frame_index in range(len(frames))
     }
-    for decision in decisions:
-        if decision.status != "active":
-            continue
-        confirmed_markers = {
-            person_marker(decision.person_id, decision.marker),
-        } | {
-            person_marker(decision.person_id, joint)
-            for joint in (
-                decision.related_markers or kinematic_group(decision.marker)
-            )
-        } | {
-            person_marker(decision.alternative_person_id, joint)
-            for joint in (
-                decision.alternative_related_markers
-                or decision.related_markers
-                or kinematic_group(decision.marker)
-            )
-        }
+    for decision in accepted:
+        confirmed_markers = decision_affected_markers(decision)
         for frame_index in range(decision.start_frame, decision.end_frame + 1):
             if 0 <= frame_index < len(frames):
                 confirmed[frame_index].update(confirmed_markers)
