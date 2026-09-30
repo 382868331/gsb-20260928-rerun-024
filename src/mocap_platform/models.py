@@ -65,20 +65,30 @@ class Calibration:
 
 @dataclass
 class IdentityRevision:
-    marker: str
-    start_frame: int
-    end_frame: int
-    corrected_identity: str
-    reason: str
+    revision_id: str = ""
+    marker: str = ""
+    start_frame: int = 0
+    end_frame: int = 0
+    corrected_identity: str = ""
+    reason: str = ""
+    decision: str = "confirm"
+    group: str = ""
+    propagated: bool = False
+    supersedes: str = ""
     created_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "revision_id": self.revision_id,
             "marker": self.marker,
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
             "corrected_identity": self.corrected_identity,
             "reason": self.reason,
+            "decision": self.decision,
+            "group": self.group,
+            "propagated": self.propagated,
+            "supersedes": self.supersedes,
             "created_at": self.created_at,
         }
 
@@ -98,6 +108,7 @@ class ProcessingVersion:
     statuses: list[dict[str, MarkerStatus]]
     revisions: list[IdentityRevision] = field(default_factory=list)
     based_on: str | None = None
+    ambiguities: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +123,7 @@ class ProcessingVersion:
             "created_at": self.created_at,
             "parameters": self.parameters,
             "identity_revisions": [revision.to_dict() for revision in self.revisions],
+            "ambiguities": self.ambiguities,
             "frames": self.frames,
             "statuses": self.statuses,
         }

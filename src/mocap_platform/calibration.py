@@ -11,14 +11,26 @@ def calibrate_from_action(frames: list[dict]) -> tuple[dict, dict]:
     angle_samples: dict[str, list[float]] = {joint: [] for joint in CHAIN_ARMS_LEGS}
 
     for frame in frames:
-        for start, end in BONES:
-            if frame.get(start) is not None and frame.get(end) is not None:
-                bone_samples[f"{start}->{end}"].append(distance(frame[start], frame[end]))
-        for joint, (parent, child) in CHAIN_ARMS_LEGS.items():
-            if frame.get(joint) and frame.get(parent) and frame.get(child):
-                incoming = [frame[joint][i] - frame[parent][i] for i in range(3)]
-                outgoing = [frame[child][i] - frame[joint][i] for i in range(3)]
-                angle_samples[joint].append(angle_between(incoming, outgoing))
+        qualified = any(marker.startswith("pA_") or marker.startswith("pB_") for marker in frame)
+        prefixes = sorted({marker[:3] for marker in frame if marker[:2] in ("pA", "pB")}) if qualified else [""]
+        for prefix in prefixes:
+            def q(name: str) -> str:
+                return f"{prefix}{name}" if prefix else name
+
+            for start, end in BONES:
+                if frame.get(q(start)) is not None and frame.get(q(end)) is not None:
+                    bone_samples[f"{start}->{end}"].append(
+                        distance(frame[q(start)], frame[q(end)])
+                    )
+            for joint, (parent, child) in CHAIN_ARMS_LEGS.items():
+                if frame.get(q(joint)) and frame.get(q(parent)) and frame.get(q(child)):
+                    incoming = [
+                        frame[q(joint)][i] - frame[q(parent)][i] for i in range(3)
+                    ]
+                    outgoing = [
+                        frame[q(child)][i] - frame[q(joint)][i] for i in range(3)
+                    ]
+                    angle_samples[joint].append(angle_between(incoming, outgoing))
 
     bone_lengths = {}
     for name, values in bone_samples.items():
