@@ -97,4 +97,5 @@ class PlatformStore:
             "calibration_version": result.calibration_version,
             "created_at": result.created_at,
             "revisions": [revision.to_dict() for revision in result.revisions],
+            "identity_decisions": [decision.to_dict() for decision in result.decisions],
         }

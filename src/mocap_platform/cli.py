@@ -5,7 +5,12 @@ from pathlib import Path
 
 from .calibration import calibrate_from_action
 from .evaluation import evaluate
-from .models import Calibration, CaptureRecord, IdentityRevision
+from .models import Calibration, CaptureRecord, IdentityDecision, IdentityRevision
+from .synthetic_multi import (
+    generate_multi_person_action,
+    inject_multi_person_crossing,
+    multi_person_markers,
+)
 from .reconstruction import reconstruct
 from .storage import PlatformStore
 from .synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -93,6 +98,113 @@ def demo(output: str) -> None:
     print(
         "v2 identity mismatches="
         f"{report['after_identity_revision']['identity_mismatch_count']}"
+    )
+
+    action_name = "demo_multi_person_action"
+    pipeline_name = "crossing_identity_review"
+    capture_id = "demo_capture_0002"
+
+    multi_truth = generate_multi_person_action()
+    multi_observed, multi_events, ambiguity_windows = inject_multi_person_crossing(
+        multi_truth
+    )
+    multi_capture = CaptureRecord(
+        capture_id=capture_id,
+        action_name=action_name,
+        frame_count=len(multi_observed),
+        frame_rate=30.0,
+        markers=multi_person_markers(),
+        observed_frames=multi_observed,
+        ground_truth_frames=multi_truth,
+        source="synthetic_known_multi_person_action",
+        notes="Two-person crossing, simultaneous occlusion, long gaps, and reappearance ambiguity.",
+    )
+    store.save_capture(multi_capture)
+
+    multi_bone_lengths, multi_joint_limits = calibrate_from_action(multi_truth)
+    multi_calibration = Calibration(
+        calibration_id="calibration_demo_0002",
+        capture_id=capture_id,
+        bone_lengths=multi_bone_lengths,
+        joint_limits=multi_joint_limits,
+    )
+    store.save_calibration(multi_calibration)
+
+    multi_v1 = reconstruct(
+        action_name,
+        pipeline_name,
+        capture_id,
+        multi_observed,
+        multi_calibration.to_dict(),
+        ambiguity_windows=ambiguity_windows,
+    )
+    store.save_processing(multi_v1)
+
+    crossing_confirmation = IdentityDecision(
+        decision_id="confirm_p0_left_arm_during_crossing",
+        person_id="p0",
+        marker="l_wrist",
+        start_frame=20,
+        end_frame=29,
+        decision="confirm",
+        alternative_person_id="p1",
+        reason="manual review confirms the left arm track belongs to p0 during crossing",
+        related_markers=["l_shoulder", "l_elbow", "l_wrist"],
+        alternative_related_markers=["r_shoulder", "r_elbow", "r_wrist"],
+    )
+    multi_v2 = reconstruct(
+        action_name,
+        pipeline_name,
+        capture_id,
+        multi_observed,
+        multi_calibration.to_dict(),
+        decisions=[crossing_confirmation],
+        ambiguity_windows=ambiguity_windows,
+        based_on=multi_v1,
+    )
+    store.save_processing(multi_v2)
+
+    revoked_confirmation = IdentityDecision(
+        decision_id=crossing_confirmation.decision_id,
+        person_id=crossing_confirmation.person_id,
+        marker=crossing_confirmation.marker,
+        start_frame=crossing_confirmation.start_frame,
+        end_frame=crossing_confirmation.end_frame,
+        decision=crossing_confirmation.decision,
+        alternative_person_id=crossing_confirmation.alternative_person_id,
+        reason=crossing_confirmation.reason,
+        related_markers=crossing_confirmation.related_markers,
+        alternative_related_markers=crossing_confirmation.alternative_related_markers,
+        status="revoked",
+        created_at=crossing_confirmation.created_at,
+    )
+    multi_v3 = reconstruct(
+        action_name,
+        pipeline_name,
+        capture_id,
+        multi_observed,
+        multi_calibration.to_dict(),
+        decisions=[revoked_confirmation],
+        ambiguity_windows=ambiguity_windows,
+        based_on=multi_v2,
+    )
+    store.save_processing(multi_v3)
+
+    from .evaluation import compare_identity_revisions
+
+    multi_report = {
+        "capture_id": capture_id,
+        "injected_events": multi_events,
+        "comparison": compare_identity_revisions(
+            [multi_v1.to_dict(), multi_v2.to_dict(), multi_v3.to_dict()], multi_truth
+        ),
+    }
+    store.save_report(action_name, pipeline_name, multi_report)
+    print(
+        "multi v1/v2/v3 bone RMSE="
+        f"{multi_report['comparison']['versions'][0]['metrics']['bone_length_rmse']:.6f}/"
+        f"{multi_report['comparison']['versions'][1]['metrics']['bone_length_rmse']:.6f}/"
+        f"{multi_report['comparison']['versions'][2]['metrics']['bone_length_rmse']:.6f}"
     )
 
 

@@ -4,6 +4,8 @@ import math
 from typing import Any
 
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
+from .identity import decisions_to_revisions, initial_identity_statuses
+from .identity import split_marker
 from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion
 from .skeleton import BONES, CHAIN_ARMS_LEGS, PARENTS
 
@@ -18,16 +20,24 @@ def remap_identities(
 ) -> tuple[list[Frame], list[bool]]:
     corrected: list[Frame] = [dict(frame) for frame in frames]
     changed = [False] * len(frames)
-    for revision in revisions:
-        start = max(0, revision.start_frame)
-        end = min(len(frames) - 1, revision.end_frame)
-        for frame_index in range(start, end + 1):
-            source = revision.marker
-            target = revision.corrected_identity
-            value = frames[frame_index].get(source)
-            previous_target = frames[frame_index].get(target)
-            corrected[frame_index][target] = value
-            corrected[frame_index][source] = previous_target
+    for frame_index, original in enumerate(frames):
+        swaps: dict[str, str] = {}
+        for revision in revisions:
+            if not revision.start_frame <= frame_index <= revision.end_frame:
+                continue
+            swaps[revision.marker] = revision.corrected_identity
+        handled: set[str] = set()
+        for source, target in swaps.items():
+            pair = tuple(sorted((source, target)))
+            if pair in handled:
+                continue
+            handled.add(pair)
+            reciprocal = swaps.get(target)
+            if reciprocal == source:
+                corrected[frame_index][target] = original.get(source)
+                corrected[frame_index][source] = original.get(target)
+            else:
+                corrected[frame_index][target] = original.get(source)
             changed[frame_index] = True
     return corrected, changed
 
@@ -129,39 +139,48 @@ def _enforce_bone_lengths(
             start_joint, end_joint = _bone_parts(bone_name)
             target = constraint["length"]
             for frame_index, frame in enumerate(frames):
-                start = frame.get(start_joint)
-                end = frame.get(end_joint)
-                if start is None or end is None:
-                    continue
-                actual = distance(start, end)
-                start_observed = statuses[frame_index].get(start_joint) == "observed"
-                end_observed = statuses[frame_index].get(end_joint) == "observed"
-                if start_observed and end_observed:
-                    continue
-                if actual < 1e-12:
-                    continue
-                if start_observed:
-                    frame[end_joint] = _set_vector_length(end, start, target)
-                elif end_observed:
-                    parent_name = PARENTS.get(start_joint)
-                    parent = frame.get(parent_name) if parent_name else None
-                    parent_is_observed = (
-                        parent is not None
-                        and statuses[frame_index].get(parent_name) == "observed"
-                    )
-                    previous_bone = bone_lengths.get(f"{parent_name}->{start_joint}") if parent_name else None
-                    if parent_is_observed and previous_bone:
-                        frame[start_joint] = _place_between(
-                            start,
-                            parent,
-                            end,
-                            previous_bone["length"],
-                            target,
+                people = {None}
+                for marker in frame:
+                    people.add(split_marker(marker)[0])
+                for person_id in people:
+                    prefix = "" if person_id is None else f"{person_id}_"
+                    start_name = f"{prefix}{start_joint}"
+                    end_name = f"{prefix}{end_joint}"
+                    start = frame.get(start_name)
+                    end = frame.get(end_name)
+                    if start is None or end is None:
+                        continue
+                    actual = distance(start, end)
+                    start_observed = statuses[frame_index].get(start_name) == "observed"
+                    end_observed = statuses[frame_index].get(end_name) == "observed"
+                    if start_observed and end_observed:
+                        continue
+                    if actual < 1e-12:
+                        continue
+                    if start_observed:
+                        frame[end_name] = _set_vector_length(end, start, target)
+                    elif end_observed:
+                        parent_name = PARENTS.get(start_joint)
+                        parent = frame.get(f"{prefix}{parent_name}") if parent_name else None
+                        parent_is_observed = (
+                            parent is not None
+                            and statuses[frame_index].get(f"{prefix}{parent_name}") == "observed"
                         )
+                        previous_bone = (
+                            bone_lengths.get(f"{parent_name}->{start_joint}") if parent_name else None
+                        )
+                        if parent_is_observed and previous_bone:
+                            frame[start_name] = _place_between(
+                                start,
+                                parent,
+                                end,
+                                previous_bone["length"],
+                                target,
+                            )
+                        else:
+                            frame[start_name] = _set_vector_length(start, end, target)
                     else:
-                        frame[start_joint] = _set_vector_length(start, end, target)
-                else:
-                    frame[end_joint] = _set_vector_length(end, start, target)
+                        frame[end_name] = _set_vector_length(end, start, target)
 
 
 def _set_angle(
@@ -192,28 +211,38 @@ def _enforce_joint_limits(
 ) -> None:
     for frame_index, frame in enumerate(frames):
         for joint_name, limits in joint_limits.items():
-            parent_name, child_name = CHAIN_ARMS_LEGS[joint_name]
-            parent = frame.get(parent_name)
-            joint = frame.get(joint_name)
-            child = frame.get(child_name)
-            if not parent or not joint or not child:
-                continue
-            incoming = [joint[i] - parent[i] for i in range(3)]
-            outgoing = [child[i] - joint[i] for i in range(3)]
-            if norm(incoming) < 1e-9 or norm(outgoing) < 1e-9:
-                continue
-            current = angle_between(incoming, outgoing)
-            target_angle = None
-            if current < limits["min_angle"]:
-                target_angle = limits["min_angle"]
-            elif current > limits["max_angle"]:
-                target_angle = limits["max_angle"]
-            if target_angle is None:
-                continue
-            if statuses[frame_index].get(child_name) == "recovered":
-                _set_angle(parent, joint, child, target_angle)
-            elif statuses[frame_index].get(joint_name) == "recovered":
-                frame[joint_name] = _place_between(joint, parent, child, norm(incoming), norm(outgoing))
+            parent_joint, child_joint = CHAIN_ARMS_LEGS[joint_name]
+            people = {None}
+            for marker in frame:
+                people.add(split_marker(marker)[0])
+            for person_id in people:
+                prefix = "" if person_id is None else f"{person_id}_"
+                resolved_joint = f"{prefix}{joint_name}"
+                parent_name = f"{prefix}{parent_joint}"
+                child_name = f"{prefix}{child_joint}"
+                parent = frame.get(parent_name)
+                joint = frame.get(resolved_joint)
+                child = frame.get(child_name)
+                if not parent or not joint or not child:
+                    continue
+                incoming = [joint[i] - parent[i] for i in range(3)]
+                outgoing = [child[i] - joint[i] for i in range(3)]
+                if norm(incoming) < 1e-9 or norm(outgoing) < 1e-9:
+                    continue
+                current = angle_between(incoming, outgoing)
+                target_angle = None
+                if current < limits["min_angle"]:
+                    target_angle = limits["min_angle"]
+                elif current > limits["max_angle"]:
+                    target_angle = limits["max_angle"]
+                if target_angle is None:
+                    continue
+                if statuses[frame_index].get(child_name) == "recovered":
+                    _set_angle(parent, joint, child, target_angle)
+                elif statuses[frame_index].get(resolved_joint) == "recovered":
+                    frame[resolved_joint] = _place_between(
+                        joint, parent, child, norm(incoming), norm(outgoing)
+                    )
 
 
 def apply_skeleton_constraints(
@@ -241,8 +270,12 @@ def apply_skeleton_constraints(
 
 def constraint_violations(frame: Frame, calibration: dict[str, Any], marker: str) -> int:
     violations = 0
+    person_id, _joint_name = split_marker(marker)
+    prefix = "" if person_id is None else f"{person_id}_"
     for bone_name, constraint in calibration["bone_lengths"].items():
         start_name, end_name = _bone_parts(bone_name)
+        start_name = f"{prefix}{start_name}"
+        end_name = f"{prefix}{end_name}"
         if marker not in (start_name, end_name):
             continue
         start, end = frame.get(start_name), frame.get(end_name)
@@ -264,6 +297,18 @@ def _affected_window(revisions: list[IdentityRevision], frame_count: int) -> tup
     return start, end
 
 
+def _decision_window(
+    decisions: list[Any], revisions: list[IdentityRevision], frame_count: int
+) -> tuple[int, int] | None:
+    if decisions:
+        start = max(0, min(decision.start_frame for decision in decisions) - 2)
+        end = min(frame_count - 1, max(decision.end_frame for decision in decisions) + 2)
+        return start, end
+    if revisions:
+        return _affected_window(revisions, frame_count)
+    return None
+
+
 def reconstruct(
     action_name: str,
     pipeline_name: str,
@@ -273,13 +318,21 @@ def reconstruct(
     *,
     max_gap_frames: int = 5,
     revisions: list[IdentityRevision] | None = None,
+    decisions: list[Any] | None = None,
+    ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
-    revisions = revisions or []
+    decisions = decisions or []
+    revisions = revisions or decisions_to_revisions(decisions)
+    ambiguity_windows = ambiguity_windows or []
     corrected, changed = remap_identities(observations, revisions)
+    identity_statuses = initial_identity_statuses(
+        observations, ambiguity_windows, decisions
+    )
 
-    if based_on is not None and revisions:
-        start, end = _affected_window(revisions, len(observations))
+    decision_window = _decision_window(decisions, revisions, len(observations))
+    if based_on is not None and decision_window is not None:
+        start, end = decision_window
         frames = [dict(frame) for frame in based_on.frames]
         statuses = [dict(status) for status in based_on.statuses]
         window_observations = corrected[start : end + 1]
@@ -290,16 +343,28 @@ def reconstruct(
         for offset, frame in enumerate(local_frames):
             frames[start + offset] = frame
             statuses[start + offset] = local_statuses[offset]
+        for frame_index in range(start, end + 1):
+            previous_statuses = (
+                based_on.identity_statuses[frame_index]
+                if based_on.identity_statuses
+                else {}
+            )
+            identity_statuses[frame_index] = {
+                marker: identity_statuses[frame_index].get(marker, previous)
+                for marker, previous in previous_statuses.items()
+            }
         parameters = {
             "max_gap_frames": max_gap_frames,
             "recompute_window": {"start_frame": start, "end_frame": end},
             "changed_frames": [i for i, value in enumerate(changed) if value],
+            "ambiguity_windows": ambiguity_windows,
         }
         version = _next_version(based_on.version)
     else:
         frames, statuses = interpolate_gaps(corrected, max_gap_frames)
         frames, statuses = apply_skeleton_constraints(frames, statuses, calibration)
         parameters = {"max_gap_frames": max_gap_frames, "recompute_window": None}
+        parameters["ambiguity_windows"] = ambiguity_windows
         version = "v001"
 
     return ProcessingVersion(
@@ -312,6 +377,8 @@ def reconstruct(
         frames=frames,
         statuses=statuses,
         revisions=revisions,
+        decisions=decisions,
+        identity_statuses=identity_statuses,
         based_on=based_on.version if based_on else None,
     )
 

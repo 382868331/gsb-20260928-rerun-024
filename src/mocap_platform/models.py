@@ -83,7 +83,40 @@ class IdentityRevision:
         }
 
 
+@dataclass
+class IdentityDecision:
+    decision_id: str
+    person_id: str
+    marker: str
+    start_frame: int
+    end_frame: int
+    decision: Literal["confirm", "deny"]
+    alternative_person_id: str
+    reason: str
+    related_markers: list[str] = field(default_factory=list)
+    alternative_related_markers: list[str] = field(default_factory=list)
+    status: Literal["active", "revoked"] = "active"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "person_id": self.person_id,
+            "marker": self.marker,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "decision": self.decision,
+            "alternative_person_id": self.alternative_person_id,
+            "reason": self.reason,
+            "related_markers": self.related_markers,
+            "alternative_related_markers": self.alternative_related_markers,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
 MarkerStatus = Literal["observed", "recovered", "uncertain", "missing"]
+IdentityStatus = Literal["certain", "confirmed", "ambiguous"]
 
 
 @dataclass
@@ -97,6 +130,8 @@ class ProcessingVersion:
     frames: list[Frame]
     statuses: list[dict[str, MarkerStatus]]
     revisions: list[IdentityRevision] = field(default_factory=list)
+    decisions: list[IdentityDecision] = field(default_factory=list)
+    identity_statuses: list[dict[str, IdentityStatus]] = field(default_factory=list)
     based_on: str | None = None
     created_at: str = field(default_factory=utc_now)
 
@@ -112,6 +147,8 @@ class ProcessingVersion:
             "created_at": self.created_at,
             "parameters": self.parameters,
             "identity_revisions": [revision.to_dict() for revision in self.revisions],
+            "identity_decisions": [decision.to_dict() for decision in self.decisions],
             "frames": self.frames,
             "statuses": self.statuses,
+            "identity_statuses": self.identity_statuses,
         }

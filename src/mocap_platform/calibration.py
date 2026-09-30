@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 from .geometry import angle_between, distance, mean
+from .identity import split_marker
 from .skeleton import BONES, CHAIN_ARMS_LEGS
 
 
@@ -11,14 +12,33 @@ def calibrate_from_action(frames: list[dict]) -> tuple[dict, dict]:
     angle_samples: dict[str, list[float]] = {joint: [] for joint in CHAIN_ARMS_LEGS}
 
     for frame in frames:
-        for start, end in BONES:
-            if frame.get(start) is not None and frame.get(end) is not None:
-                bone_samples[f"{start}->{end}"].append(distance(frame[start], frame[end]))
-        for joint, (parent, child) in CHAIN_ARMS_LEGS.items():
-            if frame.get(joint) and frame.get(parent) and frame.get(child):
-                incoming = [frame[joint][i] - frame[parent][i] for i in range(3)]
-                outgoing = [frame[child][i] - frame[joint][i] for i in range(3)]
-                angle_samples[joint].append(angle_between(incoming, outgoing))
+        people = {None}
+        for marker in frame:
+            people.add(split_marker(marker)[0])
+        for person_id in people:
+            prefix = "" if person_id is None else f"{person_id}_"
+            for start, end in BONES:
+                person_start, person_end = f"{prefix}{start}", f"{prefix}{end}"
+                if frame.get(person_start) is not None and frame.get(person_end) is not None:
+                    bone_samples[f"{start}->{end}"].append(
+                        distance(frame[person_start], frame[person_end])
+                    )
+        for person_id in people:
+                prefix = "" if person_id is None else f"{person_id}_"
+                for joint, (parent, child) in CHAIN_ARMS_LEGS.items():
+                    person_joint, person_parent, person_child = (
+                        f"{prefix}{joint}",
+                        f"{prefix}{parent}",
+                        f"{prefix}{child}",
+                    )
+                    if frame.get(person_joint) and frame.get(person_parent) and frame.get(person_child):
+                        incoming = [
+                            frame[person_joint][i] - frame[person_parent][i] for i in range(3)
+                        ]
+                        outgoing = [
+                            frame[person_child][i] - frame[person_joint][i] for i in range(3)
+                        ]
+                        angle_samples[joint].append(angle_between(incoming, outgoing))
 
     bone_lengths = {}
     for name, values in bone_samples.items():
