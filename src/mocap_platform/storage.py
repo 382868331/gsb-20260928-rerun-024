@@ -6,7 +6,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .models import Calibration, CaptureRecord, IdentityDecision, ProcessingVersion
+from .models import (
+    Calibration,
+    CaptureRecord,
+    IdentityDecision,
+    ProcessingVersion,
+    TrackReassignment,
+)
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -139,11 +145,77 @@ class PlatformStore:
         for path in sorted(directory.glob("*.json")):
             if path.name.endswith(".revocation.json"):
                 continue
+            if path.name.endswith(".reassignment.withdrawal.json"):
+                continue
             data = read_json(path)
+            if data.get("kind") == "track_reassignment":
+                continue
             if data["decision_id"] in revoked:
                 data["status"] = "revoked"
             decisions.append(data)
         return decisions
+
+    def save_reassignment(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        reassignment: TrackReassignment,
+    ) -> Path:
+        path = (
+            self.decisions_dir(action_name, pipeline_name)
+            / f"{reassignment.reassignment_id}.reassignment.json"
+        )
+        if path.exists():
+            raise FileExistsError(f"reassignment is immutable and already exists: {path}")
+        atomic_write_json(path, reassignment.to_dict())
+        return path
+
+    def withdraw_reassignment(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        reassignment_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.decisions_dir(action_name, pipeline_name)
+        reassignment_path = directory / f"{reassignment_id}.reassignment.json"
+        if not reassignment_path.exists():
+            raise FileNotFoundError(
+                f"cannot withdraw unknown reassignment: {reassignment_path}"
+            )
+        path = directory / f"{reassignment_id}.reassignment.withdrawal.json"
+        if path.exists():
+            raise FileExistsError(f"reassignment already withdrawn: {path}")
+        from .models import utc_now
+
+        atomic_write_json(
+            path,
+            {
+                "kind": "track_reassignment_withdrawal",
+                "reassignment_id": reassignment_id,
+                "reason": reason,
+                "withdrawn_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_reassignments(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.decisions_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        withdrawn = {
+            path.name[: -len(".reassignment.withdrawal.json")]
+            for path in directory.glob("*.reassignment.withdrawal.json")
+        }
+        records = []
+        for path in sorted(directory.glob("*.reassignment.json")):
+            data = read_json(path)
+            if data["reassignment_id"] in withdrawn:
+                data["status"] = "revoked"
+            records.append(data)
+        return records
 
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:
@@ -155,4 +227,5 @@ class PlatformStore:
             "created_at": result.created_at,
             "revisions": [revision.to_dict() for revision in result.revisions],
             "identity_decisions": [decision.to_dict() for decision in result.decisions],
+            "track_reassignments": [item.to_dict() for item in result.reassignments],
         }

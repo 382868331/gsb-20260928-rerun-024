@@ -7,7 +7,13 @@ from pathlib import Path
 
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
-from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
+from mocap_platform.models import (
+    CaptureRecord,
+    IdentityDecision,
+    IdentityRevision,
+    TrackReassignment,
+)
+from mocap_platform.export_adapters import export_decision_csv, export_review_bundle
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -18,6 +24,130 @@ from mocap_platform.synthetic_multi import (
 
 
 class PlatformIntegrationTest(unittest.TestCase):
+    def test_scoped_track_reassignment_dispute_withdrawal_and_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "scoped_confirmation_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v6, v7, v8 = (load(version) for version in ("v006", "v007", "v008"))
+            capture = store.load_capture("demo_capture_0003")
+
+            self.assertEqual(v6["identity_statuses"][22]["p0_l_wrist"], "pending")
+            self.assertEqual(v6["identity_statuses"][22]["p1_r_wrist"], "pending")
+            self.assertEqual(v6["frames"][22]["p0_l_wrist"], capture["ground_truth"][22]["p0_l_wrist"])
+            self.assertEqual(v8["identity_statuses"][22]["p0_l_wrist"], "pending")
+            self.assertEqual(v8["identity_statuses"][22]["p1_r_wrist"], "pending")
+            self.assertEqual(v8["identity_statuses"][41]["p0_l_wrist"], "ambiguous")
+
+            preview = next(
+                item
+                for item in v7["parameters"]["reassignment_previews"]
+                if item["reassignment_id"] == "reassignment_003_ankle_p0_to_p1"
+            )
+            arm_preview = v6["parameters"]["reassignment_previews"][0]
+            self.assertEqual(
+                arm_preview["related_changes"]["marker_confirmations"][0]["state"],
+                "pending_recheck",
+            )
+            self.assertTrue(preview["related_changes"]["occlusion_judgments"])
+            self.assertTrue(preview["related_changes"]["skeleton_correspondences"])
+            self.assertEqual(
+                arm_preview["dependencies"][0]["requires"],
+                "reassignment_002_arm_p1_to_p0",
+            )
+
+            self.assertEqual(v7["identity_statuses"][25]["p0_r_ankle"], "disputed")
+            self.assertEqual(v7["identity_statuses"][25]["p1_r_ankle"], "disputed")
+            blockers = v7["parameters"]["occupancy_blockers"]
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(
+                blockers[0]["reassignment_id"], "reassignment_004_ankle_p1_to_p0"
+            )
+            self.assertEqual(
+                blockers[0]["blocked_by"], "reassignment_003_ankle_p0_to_p1"
+            )
+            self.assertEqual(
+                blockers[0]["markers"],
+                [
+                    "p0_r_ankle",
+                    "p0_r_hip",
+                    "p0_r_knee",
+                    "p1_r_ankle",
+                    "p1_r_hip",
+                    "p1_r_knee",
+                ],
+            )
+
+            impacts = {
+                item["reassignment_id"]: item["status"]
+                for item in v8["parameters"]["reassignment_impacts"]
+            }
+            self.assertEqual(impacts["reassignment_001_arm_p0_to_p1"], "revoked")
+            self.assertEqual(impacts["reassignment_002_arm_p1_to_p0"], "revoked")
+            self.assertEqual(impacts["reassignment_003_ankle_p0_to_p1"], "applied")
+            self.assertEqual(impacts["reassignment_004_ankle_p1_to_p0"], "disputed")
+
+            stored = store.load_reassignments(action, pipeline)
+            self.assertEqual(len(stored), 4)
+            stored_statuses = {item["reassignment_id"]: item["status"] for item in stored}
+            self.assertEqual(stored_statuses["reassignment_001_arm_p0_to_p1"], "revoked")
+            self.assertEqual(stored_statuses["reassignment_003_ankle_p0_to_p1"], "active")
+            self.assertEqual(len(store.load_decisions(action, pipeline)), 3)
+            with self.assertRaises(FileExistsError):
+                store.save_reassignment(
+                    action,
+                    pipeline,
+                    TrackReassignment(
+                        reassignment_id="reassignment_001_arm_p0_to_p1",
+                        source_person_id="p0",
+                        target_person_id="p1",
+                        marker="l_wrist",
+                        start_frame=20,
+                        end_frame=24,
+                    ),
+                )
+            with self.assertRaises(FileExistsError):
+                store.withdraw_reassignment(
+                    action, pipeline, "reassignment_001_arm_p0_to_p1"
+                )
+            with self.assertRaises(FileNotFoundError):
+                store.withdraw_reassignment(action, pipeline, "reassignment_999_missing")
+
+            bundle_path = export_review_bundle(
+                store,
+                Path(directory, "exports", "review.json"),
+                action,
+                pipeline,
+                v8,
+            )
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                bundle["capture"]["original_observations"], capture["observations"]
+            )
+            self.assertEqual(len(bundle["reassignment_scopes"]), 4)
+            self.assertEqual(bundle["frame_provenance"][25]["frame"], 25)
+            self.assertTrue(bundle["decision_sources"]["dependent_confirmations"])
+
+            csv_path = export_decision_csv(v8, Path(directory, "exports", "sources.csv"))
+            csv_text = csv_path.read_text(encoding="utf-8")
+            self.assertIn("track_reassignment,reassignment_004_ankle_p1_to_p0,active", csv_text)
+
+            report = json.loads(base.joinpath("evaluation_report.json").read_text(encoding="utf-8"))
+            review = report["reassignment_review"]
+            self.assertEqual(review["versions"][0]["version"], "v005")
+            self.assertEqual(review["versions"][-1]["version"], "v008")
+            self.assertIn("pose_metrics_change", review["before_after"])
+
     def test_scoped_confirmation_conflicts_revocation_and_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             demo(directory)

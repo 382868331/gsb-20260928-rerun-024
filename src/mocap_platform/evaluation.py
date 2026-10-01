@@ -187,3 +187,60 @@ def compare_identity_revisions(
         )
         == 1,
     }
+
+
+def compare_reassignment_review(
+    versions: list[dict[str, Any]], ground_truth: list[dict[str, Any]]
+) -> dict[str, Any]:
+    summaries = []
+    for version in versions:
+        metrics = evaluate_multi_person(version, ground_truth)
+        statuses = version.get("identity_statuses", [])
+        counts = {
+            "reassigned": 0,
+            "pending": 0,
+            "disputed": 0,
+            "ambiguous": 0,
+            "confirmed": 0,
+        }
+        for frame in statuses:
+            for status in frame.values():
+                if status in counts:
+                    counts[status] += 1
+        summaries.append(
+            {
+                "version": version["version"],
+                "based_on": version.get("based_on"),
+                "pose_metrics": metrics,
+                "identity_status_counts": counts,
+                "unresolved_marker_frames": counts["pending"]
+                + counts["disputed"]
+                + counts["ambiguous"],
+                "reassignment_scopes": [
+                    {
+                        "reassignment_id": item["reassignment_id"],
+                        "status": item["status"],
+                        "resolution": item["resolution"],
+                        "start_frame": item["start_frame"],
+                        "end_frame": item["end_frame"],
+                    }
+                    for item in version.get("track_reassignments", [])
+                ],
+            }
+        )
+    return {
+        "versions": summaries,
+        "before_after": {
+            "first_version": summaries[0]["version"] if summaries else None,
+            "last_version": summaries[-1]["version"] if summaries else None,
+            "pose_metrics_change": {
+                key: (summaries[-1]["pose_metrics"].get(key) or 0.0)
+                - (summaries[0]["pose_metrics"].get(key) or 0.0)
+                for key in (
+                    "bone_length_rmse",
+                    "identity_continuity_rmse",
+                    "ambiguous_identity_marker_frames",
+                )
+            } if summaries else {},
+        },
+    }

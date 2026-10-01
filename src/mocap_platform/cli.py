@@ -5,7 +5,13 @@ from pathlib import Path
 
 from .calibration import calibrate_from_action
 from .evaluation import evaluate
-from .models import Calibration, CaptureRecord, IdentityDecision, IdentityRevision
+from .models import (
+    Calibration,
+    CaptureRecord,
+    IdentityDecision,
+    IdentityRevision,
+    TrackReassignment,
+)
 from .synthetic_multi import (
     generate_multi_person_action,
     inject_multi_person_crossing,
@@ -14,7 +20,15 @@ from .synthetic_multi import (
 )
 from .reconstruction import reconstruct
 from .storage import PlatformStore
+from .evaluation import compare_reassignment_review
+from .export_adapters import export_decision_csv, export_review_bundle
 from .synthetic import generate_known_action, inject_occlusions_and_swaps
+
+
+def _reassignment_from_dict(data: dict) -> TrackReassignment:
+    payload = dict(data)
+    payload.pop("kind", None)
+    return TrackReassignment(**payload)
 
 
 def demo(output: str) -> None:
@@ -341,6 +355,117 @@ def demo(output: str) -> None:
     )
     store.save_processing(scoped_v5)
 
+    arm_to_p1 = TrackReassignment(
+        reassignment_id="reassignment_001_arm_p0_to_p1",
+        source_person_id="p0",
+        target_person_id="p1",
+        marker="l_wrist",
+        start_frame=20,
+        end_frame=24,
+        related_markers=["l_shoulder", "l_elbow", "l_wrist"],
+        target_related_markers=["r_shoulder", "r_elbow", "r_wrist"],
+        paired_reassignment_id="reassignment_002_arm_p1_to_p0",
+        reason="manual segment reassignment after two people cross",
+    )
+    arm_to_p0 = TrackReassignment(
+        reassignment_id="reassignment_002_arm_p1_to_p0",
+        source_person_id="p1",
+        target_person_id="p0",
+        marker="r_wrist",
+        start_frame=20,
+        end_frame=24,
+        related_markers=["r_shoulder", "r_elbow", "r_wrist"],
+        target_related_markers=["l_shoulder", "l_elbow", "l_wrist"],
+        paired_reassignment_id="reassignment_001_arm_p0_to_p1",
+        reason="reciprocal adjustment required by the paired arm exchange",
+    )
+    store.save_reassignment(action_name, scoped_pipeline, arm_to_p1)
+    store.save_reassignment(action_name, scoped_pipeline, arm_to_p0)
+    v6_reassignments = [
+        _reassignment_from_dict(item)
+        for item in store.load_reassignments(action_name, scoped_pipeline)
+    ]
+    scoped_v6 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=reloaded_decisions,
+        reassignments=v6_reassignments,
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v5,
+    )
+    store.save_processing(scoped_v6)
+
+    ankle_to_p1 = TrackReassignment(
+        reassignment_id="reassignment_003_ankle_p0_to_p1",
+        source_person_id="p0",
+        target_person_id="p1",
+        marker="r_ankle",
+        start_frame=25,
+        end_frame=29,
+        reason="first one-sided ankle reassignment adopts the available segment",
+    )
+    ankle_to_p0 = TrackReassignment(
+        reassignment_id="reassignment_004_ankle_p1_to_p0",
+        source_person_id="p1",
+        target_person_id="p0",
+        marker="r_ankle",
+        start_frame=25,
+        end_frame=29,
+        resolution="disputed",
+        paired_reassignment_id="reassignment_003_ankle_p0_to_p1",
+        reason="reviewer keeps the disagreement instead of silently sharing the track",
+    )
+    store.save_reassignment(action_name, scoped_pipeline, ankle_to_p1)
+    store.save_reassignment(action_name, scoped_pipeline, ankle_to_p0)
+    v7_reassignments = [
+        _reassignment_from_dict(item)
+        for item in store.load_reassignments(action_name, scoped_pipeline)
+    ]
+    scoped_v7 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=reloaded_decisions,
+        reassignments=v7_reassignments,
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v6,
+    )
+    store.save_processing(scoped_v7)
+
+    store.withdraw_reassignment(
+        action_name,
+        scoped_pipeline,
+        arm_to_p1.reassignment_id,
+        reason="withdraw the arm identity exchange and reopen dependent review",
+    )
+    store.withdraw_reassignment(
+        action_name,
+        scoped_pipeline,
+        arm_to_p0.reassignment_id,
+        reason="withdraw the reciprocal side of the arm identity exchange",
+    )
+    v8_reassignments = [
+        _reassignment_from_dict(item)
+        for item in store.load_reassignments(action_name, scoped_pipeline)
+    ]
+    scoped_v8 = reconstruct(
+        action_name,
+        scoped_pipeline,
+        scoped_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=reloaded_decisions,
+        reassignments=v8_reassignments,
+        ambiguity_windows=scoped_windows,
+        based_on=scoped_v7,
+    )
+    store.save_processing(scoped_v8)
+
     scoped_versions = [
         scoped_v1.to_dict(),
         scoped_v2.to_dict(),
@@ -357,6 +482,15 @@ def demo(output: str) -> None:
             "decision_conflicts": scoped_v5.parameters["decision_conflicts"],
             "restored_ambiguities": scoped_v5.parameters["restored_ambiguities"],
         },
+        "reassignment_review": compare_reassignment_review(
+            [
+                scoped_v5.to_dict(),
+                scoped_v6.to_dict(),
+                scoped_v7.to_dict(),
+                scoped_v8.to_dict(),
+            ],
+            scoped_truth,
+        ),
     }
     store.save_report(action_name, scoped_pipeline, scoped_report)
     scoped_metrics = [
@@ -364,6 +498,18 @@ def demo(output: str) -> None:
         for item in scoped_report["comparison"]["versions"]
     ]
     print(f"scoped v1..v5 ambiguous marker frames={scoped_metrics}")
+    export_review_bundle(
+        store,
+        Path(output, "exports", "scoped_reassignment_review.json"),
+        action_name,
+        scoped_pipeline,
+        scoped_v8.to_dict(),
+    )
+    export_decision_csv(
+        scoped_v8.to_dict(),
+        Path(output, "exports", "scoped_decision_sources.csv"),
+    )
+    print("scoped v6..v8 track reassignment review exported")
 
 
 def main() -> None:

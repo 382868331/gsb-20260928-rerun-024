@@ -10,6 +10,8 @@
 
 人工决定严格按对象和时间范围生效：确认右踝一小段时间只清除该决定覆盖的标记与帧，其他标记（如左腕）和其他时间段的歧义继续保持 `ambiguous`。多条决定冲突时逐条处理——先到的决定生效，冲突决定不应用并逐条记录冲突窗口、涉及标记与双方轨迹；每条决定的影响轨迹（`decision_impacts`）、各自帧范围（`decision_windows`）和撤回后重新出现的歧义（`restored_ambiguities`）都写入对应处理版本的 `parameters`。局部遮挡、人员交叉与相邻确认区间共用窗口时范围仍逐条区分。决定本身持久化在 `processing/<action>/<pipeline>/decisions/` 下，写入后不可覆盖，撤销以独立的撤销记录追加，重开后可通过 `load_decisions` 继续核对。
 
+交叉后的整段轨迹改归使用独立的 track_reassignments 记录，只在选定帧范围内生效。应用前生成 reassignment_previews，显式列出会重核的标记确认、随身份移动的遮挡判断、要重建的骨架对应、成对调整依赖和未解决区间。同一轨迹已经被另一人采用时不会静默共用：用户可以保存 disputed 争议或提交双方成对调整，occupancy_blockers 会保留占用者、重叠帧和标记链。撤回身份交换后，依赖该交换的确认在原区间进入 pending，其他时间和其他人员的确认、歧义保持原样。
+
 ## 快速运行
 
 ```bash
@@ -26,6 +28,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 5. 生成处理 v2，并将恢复位置与真实动作比较。
 6. 额外生成双人交错动作：v001 保留交叉和重现歧义，v002 应用人工确认并传播到肩/肘/腕，v003 撤销确认后重新生成同一窗口。
 7. 生成限定范围复核场景（手臂交叉 + 右踝短时交换 + 局部遮挡 + 重现歧义）：v001 基线；v002 仅确认右踝 25–29 帧，左腕与其他时段歧义保留；v003 追加相邻区间（20–24 帧）左臂确认，两个决定窗口分别记录；v004 引入冲突的否定决定，逐条记录且不应用；v005 撤销踝部确认并演示从磁盘重载决定后继续核对，被撤窗口的歧义重新出现。
+8. 在同一复核流上生成 v006–v008：v006 预览并应用 20–24 帧手臂成对改归，依赖旧确认进入 pending；v007 对 25–29 帧踝部轨迹保留占用争议；v008 撤回手臂交换后重开继续审阅，并导出原始采集、改归范围和逐项决定来源。
 
 主要结果在：
 
@@ -37,5 +40,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 - `data/processing/demo_multi_person_action/scoped_confirmation_review/versions/v00{1,2,3,4,5}/reconstruction.json`
 - `data/processing/demo_multi_person_action/scoped_confirmation_review/decisions/`
 - `data/processing/demo_multi_person_action/scoped_confirmation_review/evaluation_report.json`
+- `data/exports/scoped_reassignment_review.json`
+- `data/exports/scoped_decision_sources.csv`
 
 双人报告会并排比较三个版本的骨长 RMSE、跨人员接触帧、身份连续性误差以及保留的歧义标记帧数量。

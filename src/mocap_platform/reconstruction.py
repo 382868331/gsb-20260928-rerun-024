@@ -5,14 +5,20 @@ from typing import Any
 
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
 from .identity import (
+    apply_reassignment_identity_statuses,
     decision_affected_markers,
+    decisions_effective_for_reconstruction,
     decision_trajectories,
     decisions_to_revisions,
     initial_identity_statuses,
+    preview_reassignment,
+    reassignment_affected_markers,
+    reassignments_to_revisions,
     resolve_decisions,
+    resolve_reassignments,
 )
 from .identity import split_marker
-from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion
+from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion, TrackReassignment
 from .skeleton import BONES, CHAIN_ARMS_LEGS, PARENTS
 
 
@@ -304,11 +310,18 @@ def _affected_window(revisions: list[IdentityRevision], frame_count: int) -> tup
 
 
 def _decision_window(
-    decisions: list[Any], revisions: list[IdentityRevision], frame_count: int
+    decisions: list[Any],
+    revisions: list[IdentityRevision],
+    reassignments: list[Any],
+    frame_count: int,
 ) -> tuple[int, int] | None:
-    if decisions:
-        start = max(0, min(decision.start_frame for decision in decisions) - 2)
-        end = min(frame_count - 1, max(decision.end_frame for decision in decisions) + 2)
+    timed_items = [
+        *decisions,
+        *[item for item in reassignments if item.status == "active"],
+    ]
+    if timed_items:
+        start = max(0, min(item.start_frame for item in timed_items) - 2)
+        end = min(frame_count - 1, max(item.end_frame for item in timed_items) + 2)
         return start, end
     if revisions:
         return _affected_window(revisions, frame_count)
@@ -391,24 +404,97 @@ def reconstruct(
     max_gap_frames: int = 5,
     revisions: list[IdentityRevision] | None = None,
     decisions: list[Any] | None = None,
+    reassignments: list[TrackReassignment] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
     decisions = decisions or []
-    revisions = revisions or decisions_to_revisions(decisions)
+    reassignments = reassignments or []
+    effective_decisions = decisions_effective_for_reconstruction(decisions, reassignments)
+    revisions = revisions or [
+        *decisions_to_revisions(effective_decisions),
+        *reassignments_to_revisions(reassignments),
+    ]
     ambiguity_windows = ambiguity_windows or []
     _accepted, conflicts = resolve_decisions(decisions)
+    _paired, disputed, occupancy_blockers = resolve_reassignments(reassignments)
     corrected, changed = remap_identities(observations, revisions)
     identity_statuses = initial_identity_statuses(
-        observations, ambiguity_windows, decisions
+        observations, ambiguity_windows, effective_decisions
+    )
+    _preview_frames, preview_statuses = interpolate_gaps(observations, max_gap_frames)
+    reassignment_previews = [
+        preview_reassignment(item, reassignments, decisions, preview_statuses)
+        for item in sorted(
+            reassignments,
+            key=lambda item: (item.created_at, item.reassignment_id),
+        )
+    ]
+    seen_dependent_confirmations: set[tuple[Any, ...]] = set()
+    dependent_confirmations = []
+    for preview in reassignment_previews:
+        for change in preview["related_changes"]["marker_confirmations"]:
+            key = (
+                change["decision_id"],
+                change["start_frame"],
+                change["end_frame"],
+                tuple(change["markers"]),
+            )
+            if key in seen_dependent_confirmations:
+                continue
+            seen_dependent_confirmations.add(key)
+            dependent_confirmations.append(change)
+    identity_statuses = apply_reassignment_identity_statuses(
+        identity_statuses, reassignments, decisions
     )
     decision_parameters = {
         "decision_impacts": _decision_impacts(decisions, conflicts),
         "decision_conflicts": conflicts,
         "decision_windows": _decision_windows(decisions),
+        "reassignment_previews": reassignment_previews,
+        "reassignment_impacts": [
+            {
+                "reassignment_id": item.reassignment_id,
+                "status": "revoked"
+                if item.status == "revoked"
+                else "disputed"
+                if any(dispute.reassignment_id == item.reassignment_id for dispute in disputed)
+                else "applied",
+                "resolution": item.resolution,
+                "paired_reassignment_id": item.paired_reassignment_id,
+                "trajectories": [
+                    {
+                        "marker": trajectory["marker"],
+                        "start_frame": trajectory["start_frame"],
+                        "end_frame": trajectory["end_frame"],
+                    }
+                    for trajectory in [
+                        trajectory
+                        for preview in reassignment_previews
+                        if preview["reassignment_id"] == item.reassignment_id
+                        for trajectory in preview["trajectories"]
+                    ]
+                ],
+            }
+            for item in reassignments
+        ],
+        "reassignment_windows": [
+            {
+                "reassignment_id": item.reassignment_id,
+                "start_frame": item.start_frame,
+                "end_frame": item.end_frame,
+                "markers": sorted(reassignment_affected_markers(item)),
+            }
+            for item in reassignments
+            if item.status == "active"
+        ],
+        "occupancy_blockers": occupancy_blockers,
+        "dependent_confirmations": dependent_confirmations,
     }
 
-    decision_window = _decision_window(decisions, revisions, len(observations))
+    decision_window = _decision_window(
+        decisions, revisions, reassignments, len(observations)
+    )
     if based_on is not None and decision_window is not None:
         start, end = decision_window
         frames = [dict(frame) for frame in based_on.frames]
@@ -465,6 +551,7 @@ def reconstruct(
         statuses=statuses,
         revisions=revisions,
         decisions=decisions,
+        reassignments=reassignments,
         identity_statuses=identity_statuses,
         based_on=based_on.version if based_on else None,
     )

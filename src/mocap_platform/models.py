@@ -116,7 +116,49 @@ class IdentityDecision:
 
 
 MarkerStatus = Literal["observed", "recovered", "uncertain", "missing"]
-IdentityStatus = Literal["certain", "confirmed", "ambiguous"]
+IdentityStatus = Literal[
+    "certain",
+    "confirmed",
+    "ambiguous",
+    "pending",
+    "disputed",
+    "reassigned",
+]
+
+
+@dataclass
+class TrackReassignment:
+    reassignment_id: str
+    source_person_id: str
+    target_person_id: str
+    marker: str
+    start_frame: int
+    end_frame: int
+    related_markers: list[str] = field(default_factory=list)
+    target_related_markers: list[str] = field(default_factory=list)
+    resolution: Literal["paired_adjustment", "disputed"] = "paired_adjustment"
+    paired_reassignment_id: str | None = None
+    reason: str = ""
+    status: Literal["active", "revoked"] = "active"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "track_reassignment",
+            "reassignment_id": self.reassignment_id,
+            "source_person_id": self.source_person_id,
+            "target_person_id": self.target_person_id,
+            "marker": self.marker,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "related_markers": self.related_markers,
+            "target_related_markers": self.target_related_markers,
+            "resolution": self.resolution,
+            "paired_reassignment_id": self.paired_reassignment_id,
+            "reason": self.reason,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass
@@ -131,6 +173,7 @@ class ProcessingVersion:
     statuses: list[dict[str, MarkerStatus]]
     revisions: list[IdentityRevision] = field(default_factory=list)
     decisions: list[IdentityDecision] = field(default_factory=list)
+    reassignments: list[TrackReassignment] = field(default_factory=list)
     identity_statuses: list[dict[str, IdentityStatus]] = field(default_factory=list)
     based_on: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -148,6 +191,7 @@ class ProcessingVersion:
             "parameters": self.parameters,
             "identity_revisions": [revision.to_dict() for revision in self.revisions],
             "identity_decisions": [decision.to_dict() for decision in self.decisions],
+            "track_reassignments": [item.to_dict() for item in self.reassignments],
             "frames": self.frames,
             "statuses": self.statuses,
             "identity_statuses": self.identity_statuses,
