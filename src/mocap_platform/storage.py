@@ -6,7 +6,14 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .models import Calibration, CaptureRecord, IdentityDecision, ProcessingVersion
+from .models import (
+    Calibration,
+    CaptureRecord,
+    IdentityDecision,
+    ProcessingVersion,
+    TrajectoryReassignment,
+    utc_now,
+)
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -145,6 +152,108 @@ class PlatformStore:
             decisions.append(data)
         return decisions
 
+    def reassignments_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "reassignments"
+
+    def save_reassignment(
+        self, action_name: str, pipeline_name: str, reassignment: TrajectoryReassignment
+    ) -> Path:
+        path = (
+            self.reassignments_dir(action_name, pipeline_name)
+            / f"{reassignment.reassignment_id}.json"
+        )
+        if path.exists():
+            raise FileExistsError(f"reassignment is immutable and already exists: {path}")
+        atomic_write_json(path, reassignment.to_dict())
+        return path
+
+    def apply_reassignment(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        reassignment_id: str,
+        kept_decision_ids: list[str] | None = None,
+    ) -> Path:
+        directory = self.reassignments_dir(action_name, pipeline_name)
+        base_path = directory / f"{reassignment_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot apply unknown reassignment: {base_path}")
+        path = directory / f"{reassignment_id}.application.json"
+        if path.exists():
+            raise FileExistsError(f"reassignment already applied: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "reassignment_application",
+                "reassignment_id": reassignment_id,
+                "kept_decision_ids": kept_decision_ids or [],
+                "applied_at": utc_now(),
+            },
+        )
+        return path
+
+    def revoke_reassignment(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        reassignment_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.reassignments_dir(action_name, pipeline_name)
+        base_path = directory / f"{reassignment_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot revoke unknown reassignment: {base_path}")
+        path = directory / f"{reassignment_id}.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"reassignment already revoked: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "reassignment_revocation",
+                "reassignment_id": reassignment_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_reassignments(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.reassignments_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".revocation.json")]
+            for path in directory.glob("*.revocation.json")
+        }
+        applications = {
+            path.name[: -len(".application.json")]: read_json(path)
+            for path in directory.glob("*.application.json")
+        }
+        reassignments: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith((".revocation.json", ".application.json")):
+                continue
+            data = read_json(path)
+            reassignment_id = data["reassignment_id"]
+            if reassignment_id in applications:
+                data["status"] = "applied"
+                data["kept_decision_ids"] = applications[reassignment_id][
+                    "kept_decision_ids"
+                ]
+            if reassignment_id in revoked:
+                data["status"] = "revoked"
+            reassignments.append(data)
+        return reassignments
+
+    def save_review_export(
+        self, action_name: str, pipeline_name: str, export: dict[str, Any]
+    ) -> Path:
+        path = self.processing_dir(action_name, pipeline_name) / "review_export.json"
+        atomic_write_json(path, export)
+        return path
+
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:
         return {
@@ -155,4 +264,7 @@ class PlatformStore:
             "created_at": result.created_at,
             "revisions": [revision.to_dict() for revision in result.revisions],
             "identity_decisions": [decision.to_dict() for decision in result.decisions],
+            "trajectory_reassignments": [
+                reassignment.to_dict() for reassignment in result.reassignments
+            ],
         }

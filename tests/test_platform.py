@@ -308,6 +308,187 @@ class PlatformIntegrationTest(unittest.TestCase):
                 metrics[0]["ambiguous_identity_marker_frames"],
             )
 
+    def test_trajectory_reassignment_disputes_dependencies_and_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "trajectory_reassignment_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v2, v3, v4, v5, v6, v7 = (
+                load(v) for v in ("v002", "v003", "v004", "v005", "v006", "v007")
+            )
+            truth = store.load_capture("demo_capture_0003")["ground_truth"]
+
+            # A proposed reassignment previews impacts without changing frames.
+            self.assertEqual(v3["frames"], v2["frames"])
+            impact = v3["parameters"]["reassignment_impacts"][0]
+            self.assertEqual(impact["reassignment_id"], "reassign_001_p1_right_arm_to_p0")
+            self.assertEqual(impact["status"], "proposed")
+            affected = impact["preview"]["affected_decisions"]
+            self.assertEqual(len(affected), 1)
+            self.assertEqual(affected[0]["decision_id"], "review_001_confirm_p0_left_arm")
+            self.assertFalse(affected[0]["kept"])
+            self.assertEqual(
+                (affected[0]["start_frame"], affected[0]["end_frame"]), (20, 24)
+            )
+            self.assertTrue(impact["preview"]["affected_ambiguity_windows"])
+
+            # Applying it reassigns only the selected window; kept decisions stay.
+            self.assertEqual(v4["frames"][25]["p0_l_wrist"], truth[25]["p0_l_wrist"])
+            self.assertEqual(v4["frames"][25]["p1_r_wrist"], truth[25]["p1_r_wrist"])
+            self.assertEqual(v4["identity_statuses"][25]["p0_l_wrist"], "confirmed")
+            applied_impact = v4["parameters"]["reassignment_impacts"][0]
+            self.assertEqual(applied_impact["status"], "applied")
+            self.assertEqual(
+                applied_impact["kept_decision_ids"], ["review_001_confirm_p0_left_arm"]
+            )
+            decision_states = {
+                item["decision_id"]: item["status"]
+                for item in v4["parameters"]["decision_impacts"]
+            }
+            self.assertEqual(decision_states["review_001_confirm_p0_left_arm"], "applied")
+            # Pose comparison covers the reassigned window before and after.
+            pose = v4["parameters"]["pose_comparison"]
+            self.assertEqual(len(pose), 1)
+            self.assertEqual((pose[0]["start_frame"], pose[0]["end_frame"]), (20, 29))
+            self.assertLess(
+                pose[0]["bone_deviation_after"], pose[0]["bone_deviation_before"]
+            )
+            self.assertIn(
+                {"start_frame": 40, "end_frame": 43},
+                pose[0]["unresolved_intervals_after"],
+            )
+
+            # A second claim on the same trajectory is disputed, never shared.
+            self.assertEqual(v6["frames"], v5["frames"])
+            disputes = v6["parameters"]["reassignment_disputes"]
+            self.assertEqual(len(disputes), 1)
+            self.assertEqual(disputes[0]["reassignment_id"], "reassign_002_same_wrist_track")
+            self.assertEqual(
+                disputes[0]["disputes_with"], "reassign_001_p1_right_arm_to_p0"
+            )
+            self.assertEqual(disputes[0]["markers"], ["p1_r_wrist"])
+            self.assertEqual(
+                (disputes[0]["start_frame"], disputes[0]["end_frame"]), (22, 26)
+            )
+            self.assertTrue(disputes[0]["reassignment_trajectories"])
+            self.assertTrue(disputes[0]["disputes_with_trajectories"])
+            states = {
+                item["reassignment_id"]: item["status"]
+                for item in v6["parameters"]["reassignment_impacts"]
+            }
+            self.assertEqual(states["reassign_001_p1_right_arm_to_p0"], "applied")
+            self.assertEqual(states["reassign_002_same_wrist_track"], "disputed")
+
+            # Revoking the reassignment re-pends only dependent confirmations.
+            self.assertEqual(v7["identity_statuses"][26]["p0_r_ankle"], "ambiguous")
+            self.assertEqual(v7["identity_statuses"][22]["p0_l_wrist"], "confirmed")
+            self.assertEqual(v7["identity_statuses"][41]["p0_l_wrist"], "ambiguous")
+            pending = v7["parameters"]["pending_confirmations"]
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["decision_id"], "review_002_confirm_p0_right_ankle")
+            self.assertEqual(pending[0]["reason"], "dependency_revoked")
+            self.assertEqual(
+                pending[0]["dependencies"], ["reassign_001_p1_right_arm_to_p0"]
+            )
+            final_states = {
+                item["decision_id"]: item["status"]
+                for item in v7["parameters"]["decision_impacts"]
+            }
+            self.assertEqual(final_states["review_001_confirm_p0_left_arm"], "applied")
+            self.assertEqual(final_states["review_002_confirm_p0_right_ankle"], "pending")
+            dependencies = {
+                item["reassignment_id"]: item["depended_by"]
+                for item in v7["parameters"]["reassignment_dependencies"]
+            }
+            self.assertEqual(
+                dependencies["reassign_001_p1_right_arm_to_p0"],
+                ["review_002_confirm_p0_right_ankle"],
+            )
+
+            # Reassignments persist immutably and reload for continued review.
+            reassignments = store.load_reassignments(action, pipeline)
+            self.assertEqual(len(reassignments), 2)
+            statuses = {item["reassignment_id"]: item["status"] for item in reassignments}
+            self.assertEqual(statuses["reassign_001_p1_right_arm_to_p0"], "revoked")
+            self.assertEqual(statuses["reassign_002_same_wrist_track"], "revoked")
+            from mocap_platform.models import TrajectoryReassignment
+
+            with self.assertRaises(FileExistsError):
+                store.save_reassignment(
+                    action,
+                    pipeline,
+                    TrajectoryReassignment(
+                        reassignment_id="reassign_001_p1_right_arm_to_p0",
+                        source_person_id="p1",
+                        target_person_id="p0",
+                        joints=["r_wrist"],
+                        start_frame=20,
+                        end_frame=29,
+                        reason="attempted overwrite",
+                    ),
+                )
+            with self.assertRaises(FileExistsError):
+                store.revoke_reassignment(
+                    action, pipeline, "reassign_001_p1_right_arm_to_p0"
+                )
+            with self.assertRaises(FileNotFoundError):
+                store.revoke_reassignment(action, pipeline, "reassign_999_missing")
+            with self.assertRaises(FileExistsError):
+                store.apply_reassignment(
+                    action, pipeline, "reassign_001_p1_right_arm_to_p0"
+                )
+
+            # The export keeps the original capture, ranges, and provenance.
+            export = json.loads(
+                base.joinpath("review_export.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(export["capture_id"], "demo_capture_0003")
+            self.assertEqual(
+                export["original_capture"]["observations"],
+                store.load_capture("demo_capture_0003")["observations"],
+            )
+            self.assertEqual(export["processing_version"], "v007")
+            ranges = {
+                item["reassignment_id"]: item for item in export["reassignment_ranges"]
+            }
+            self.assertEqual(
+                ranges["reassign_001_p1_right_arm_to_p0"]["status"], "revoked"
+            )
+            self.assertEqual(
+                (
+                    ranges["reassign_001_p1_right_arm_to_p0"]["start_frame"],
+                    ranges["reassign_001_p1_right_arm_to_p0"]["end_frame"],
+                ),
+                (20, 29),
+            )
+            provenance = {
+                item["decision_id"]: item for item in export["decision_provenance"]
+            }
+            self.assertEqual(provenance["review_001_confirm_p0_left_arm"]["status"], "applied")
+            self.assertEqual(
+                provenance["review_002_confirm_p0_right_ankle"]["status"], "pending"
+            )
+            self.assertEqual(
+                provenance["review_002_confirm_p0_right_ankle"]["depends_on"],
+                ["reassign_001_p1_right_arm_to_p0"],
+            )
+            self.assertTrue(
+                all(
+                    item["source"] == "manual_review"
+                    for item in provenance.values()
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

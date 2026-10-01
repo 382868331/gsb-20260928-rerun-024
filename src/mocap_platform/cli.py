@@ -5,7 +5,14 @@ from pathlib import Path
 
 from .calibration import calibrate_from_action
 from .evaluation import evaluate
-from .models import Calibration, CaptureRecord, IdentityDecision, IdentityRevision
+from .export_adapters import build_review_export
+from .models import (
+    Calibration,
+    CaptureRecord,
+    IdentityDecision,
+    IdentityRevision,
+    TrajectoryReassignment,
+)
 from .synthetic_multi import (
     generate_multi_person_action,
     inject_multi_person_crossing,
@@ -364,6 +371,222 @@ def demo(output: str) -> None:
         for item in scoped_report["comparison"]["versions"]
     ]
     print(f"scoped v1..v5 ambiguous marker frames={scoped_metrics}")
+
+    review_pipeline = "trajectory_reassignment_review"
+    review_capture_id = scoped_capture_id
+
+    review_v1 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        ambiguity_windows=scoped_windows,
+    )
+    store.save_processing(review_v1)
+
+    arm_decision = IdentityDecision(
+        decision_id="review_001_confirm_p0_left_arm",
+        person_id="p0",
+        marker="l_wrist",
+        start_frame=20,
+        end_frame=24,
+        decision="confirm",
+        alternative_person_id="p1",
+        reason="manual review confirms the left arm track belongs to p0",
+        related_markers=["l_shoulder", "l_elbow", "l_wrist"],
+        alternative_related_markers=["r_shoulder", "r_elbow", "r_wrist"],
+    )
+    store.save_decision(action_name, review_pipeline, arm_decision)
+    review_v2 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[arm_decision],
+        ambiguity_windows=scoped_windows,
+        based_on=review_v1,
+    )
+    store.save_processing(review_v2)
+
+    arm_reassignment = TrajectoryReassignment(
+        reassignment_id="reassign_001_p1_right_arm_to_p0",
+        source_person_id="p1",
+        target_person_id="p0",
+        joints=["r_shoulder", "r_elbow", "r_wrist"],
+        target_joints=["l_shoulder", "l_elbow", "l_wrist"],
+        start_frame=20,
+        end_frame=29,
+        reason="the track labeled p1 right arm is p0's left arm after the crossing",
+    )
+    store.save_reassignment(action_name, review_pipeline, arm_reassignment)
+    review_v3 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[arm_decision],
+        reassignments=[arm_reassignment],
+        ambiguity_windows=scoped_windows,
+        based_on=review_v2,
+    )
+    store.save_processing(review_v3)
+
+    store.apply_reassignment(
+        action_name,
+        review_pipeline,
+        arm_reassignment.reassignment_id,
+        kept_decision_ids=[arm_decision.decision_id],
+    )
+    applied_arm_reassignment = TrajectoryReassignment(
+        reassignment_id=arm_reassignment.reassignment_id,
+        source_person_id=arm_reassignment.source_person_id,
+        target_person_id=arm_reassignment.target_person_id,
+        joints=arm_reassignment.joints,
+        target_joints=arm_reassignment.target_joints,
+        start_frame=arm_reassignment.start_frame,
+        end_frame=arm_reassignment.end_frame,
+        reason=arm_reassignment.reason,
+        kept_decision_ids=[arm_decision.decision_id],
+        status="applied",
+        created_at=arm_reassignment.created_at,
+    )
+    review_v4 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[arm_decision],
+        reassignments=[applied_arm_reassignment],
+        ambiguity_windows=scoped_windows,
+        based_on=review_v3,
+    )
+    store.save_processing(review_v4)
+
+    ankle_decision = IdentityDecision(
+        decision_id="review_002_confirm_p0_right_ankle",
+        person_id="p0",
+        marker="r_ankle",
+        start_frame=25,
+        end_frame=29,
+        decision="confirm",
+        alternative_person_id="p1",
+        reason="manual review confirms the right ankle track belongs to p0",
+        depends_on=[arm_reassignment.reassignment_id],
+    )
+    store.save_decision(action_name, review_pipeline, ankle_decision)
+    review_v5 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[arm_decision, ankle_decision],
+        reassignments=[applied_arm_reassignment],
+        ambiguity_windows=scoped_windows,
+        based_on=review_v4,
+    )
+    store.save_processing(review_v5)
+
+    contested_reassignment = TrajectoryReassignment(
+        reassignment_id="reassign_002_same_wrist_track",
+        source_person_id="p1",
+        target_person_id="p0",
+        joints=["r_wrist"],
+        target_joints=["r_wrist"],
+        start_frame=22,
+        end_frame=26,
+        reason="a second reviewer claims the same wrist track for p0's right wrist",
+        status="applied",
+    )
+    store.save_reassignment(action_name, review_pipeline, contested_reassignment)
+    review_v6 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=[arm_decision, ankle_decision],
+        reassignments=[applied_arm_reassignment, contested_reassignment],
+        ambiguity_windows=scoped_windows,
+        based_on=review_v5,
+    )
+    store.save_processing(review_v6)
+
+    store.revoke_reassignment(
+        action_name,
+        review_pipeline,
+        contested_reassignment.reassignment_id,
+        reason="reviewers adjusted both sides and dropped the duplicate claim",
+    )
+    store.revoke_reassignment(
+        action_name,
+        review_pipeline,
+        arm_reassignment.reassignment_id,
+        reason="reviewer withdrew the arm trajectory reassignment",
+    )
+    reloaded_decisions = [
+        IdentityDecision(**data)
+        for data in store.load_decisions(action_name, review_pipeline)
+    ]
+    reloaded_reassignments = [
+        TrajectoryReassignment(**data)
+        for data in store.load_reassignments(action_name, review_pipeline)
+    ]
+    review_v7 = reconstruct(
+        action_name,
+        review_pipeline,
+        review_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        decisions=reloaded_decisions,
+        reassignments=reloaded_reassignments,
+        ambiguity_windows=scoped_windows,
+        based_on=review_v6,
+    )
+    store.save_processing(review_v7)
+
+    review_export = build_review_export(
+        store.load_capture(review_capture_id),
+        review_v7.to_dict(),
+        reloaded_decisions,
+        reloaded_reassignments,
+    )
+    store.save_review_export(action_name, review_pipeline, review_export)
+
+    review_versions = [
+        review_v1.to_dict(),
+        review_v2.to_dict(),
+        review_v3.to_dict(),
+        review_v4.to_dict(),
+        review_v5.to_dict(),
+        review_v6.to_dict(),
+        review_v7.to_dict(),
+    ]
+    review_report = {
+        "capture_id": review_capture_id,
+        "injected_events": scoped_events,
+        "comparison": compare_identity_revisions(review_versions, scoped_truth),
+        "reassignment_review": {
+            "reassignment_impacts": review_v7.parameters["reassignment_impacts"],
+            "reassignment_disputes": review_v6.parameters["reassignment_disputes"],
+            "reassignment_dependencies": review_v7.parameters[
+                "reassignment_dependencies"
+            ],
+            "pending_confirmations": review_v7.parameters["pending_confirmations"],
+            "pose_comparison": review_v4.parameters["pose_comparison"],
+        },
+        "review_export": "review_export.json",
+    }
+    store.save_report(action_name, review_pipeline, review_report)
+    review_metrics = [
+        item["metrics"]["ambiguous_identity_marker_frames"]
+        for item in review_report["comparison"]["versions"]
+    ]
+    print(f"reassignment review v1..v7 ambiguous marker frames={review_metrics}")
 
 
 def main() -> None:

@@ -188,16 +188,21 @@ def initial_identity_statuses(
     frames: list[dict[str, Any]],
     ambiguity_windows: list[dict[str, Any]],
     decisions: list[IdentityDecision] | None = None,
+    extra_confirmed: list[tuple[set[str], int, int]] | None = None,
 ) -> list[dict[str, str]]:
     markers = sorted({marker for frame in frames for marker in frame})
     statuses = [{marker: "certain" for marker in markers} for _ in frames]
     decisions = decisions or []
+    extra_confirmed = extra_confirmed or []
     accepted, _conflicts = resolve_decisions(decisions)
     for window in ambiguity_windows:
         for frame_index in range(window["start_frame"], window["end_frame"] + 1):
             if not 0 <= frame_index < len(statuses):
                 continue
             cleared = cleared_markers_at(accepted, frame_index)
+            for confirmed_markers, start_frame, end_frame in extra_confirmed:
+                if start_frame <= frame_index <= end_frame:
+                    cleared |= confirmed_markers
             for marker in window.get("markers", []):
                 if marker in cleared:
                     continue
@@ -210,6 +215,10 @@ def initial_identity_statuses(
     for decision in accepted:
         confirmed_markers = decision_affected_markers(decision)
         for frame_index in range(decision.start_frame, decision.end_frame + 1):
+            if 0 <= frame_index < len(frames):
+                confirmed[frame_index].update(confirmed_markers)
+    for confirmed_markers, start_frame, end_frame in extra_confirmed:
+        for frame_index in range(start_frame, end_frame + 1):
             if 0 <= frame_index < len(frames):
                 confirmed[frame_index].update(confirmed_markers)
     for frame_index, frame_status in enumerate(statuses):

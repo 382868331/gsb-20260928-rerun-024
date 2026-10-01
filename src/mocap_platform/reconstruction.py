@@ -13,6 +13,14 @@ from .identity import (
 )
 from .identity import split_marker
 from .models import Frame, IdentityRevision, MarkerStatus, ProcessingVersion
+from .reassignment import (
+    pending_confirmations,
+    reassignment_impact_preview,
+    reassignment_markers,
+    reassignment_trajectories,
+    reassignments_to_revisions,
+    resolve_reassignments,
+)
 from .skeleton import BONES, CHAIN_ARMS_LEGS, PARENTS
 
 
@@ -295,34 +303,38 @@ def constraint_violations(frame: Frame, calibration: dict[str, Any], marker: str
     return violations
 
 
-def _affected_window(revisions: list[IdentityRevision], frame_count: int) -> tuple[int, int]:
-    if not revisions:
-        return 0, frame_count - 1
-    start = max(0, min(revision.start_frame for revision in revisions) - 2)
-    end = min(frame_count - 1, max(revision.end_frame for revision in revisions) + 2)
+def _review_window(
+    decisions: list[Any],
+    revisions: list[IdentityRevision],
+    reassignments: list[Any],
+    frame_count: int,
+) -> tuple[int, int] | None:
+    ranges = [(decision.start_frame, decision.end_frame) for decision in decisions]
+    ranges += [
+        (reassignment.start_frame, reassignment.end_frame)
+        for reassignment in reassignments
+    ]
+    ranges += [(revision.start_frame, revision.end_frame) for revision in revisions]
+    if not ranges:
+        return None
+    start = max(0, min(start for start, _end in ranges) - 2)
+    end = min(frame_count - 1, max(end for _start, end in ranges) + 2)
     return start, end
 
 
-def _decision_window(
-    decisions: list[Any], revisions: list[IdentityRevision], frame_count: int
-) -> tuple[int, int] | None:
-    if decisions:
-        start = max(0, min(decision.start_frame for decision in decisions) - 2)
-        end = min(frame_count - 1, max(decision.end_frame for decision in decisions) + 2)
-        return start, end
-    if revisions:
-        return _affected_window(revisions, frame_count)
-    return None
-
-
 def _decision_impacts(
-    decisions: list[Any], conflicts: list[dict[str, Any]]
+    decisions: list[Any],
+    conflicts: list[dict[str, Any]],
+    pending_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     conflicted = {conflict["decision_id"] for conflict in conflicts}
+    pending_ids = pending_ids or set()
     impacts = []
     for decision in decisions:
         if decision.status == "revoked":
             state = "revoked"
+        elif decision.decision_id in pending_ids:
+            state = "pending"
         elif decision.decision_id in conflicted:
             state = "conflict"
         else:
@@ -336,6 +348,141 @@ def _decision_impacts(
             }
         )
     return impacts
+
+
+def _reassignment_impacts(
+    reassignments: list[Any],
+    decisions: list[Any],
+    ambiguity_windows: list[dict[str, Any]],
+    disputes: list[dict[str, Any]],
+    disputed_ids: set[str],
+) -> list[dict[str, Any]]:
+    impacts = []
+    for reassignment in reassignments:
+        if reassignment.status == "revoked":
+            state = "revoked"
+        elif reassignment.reassignment_id in disputed_ids:
+            state = "disputed"
+        else:
+            state = reassignment.status
+        impacts.append(
+            {
+                "reassignment_id": reassignment.reassignment_id,
+                "status": state,
+                "source_person_id": reassignment.source_person_id,
+                "target_person_id": reassignment.target_person_id,
+                "start_frame": reassignment.start_frame,
+                "end_frame": reassignment.end_frame,
+                "trajectories": reassignment_trajectories(reassignment),
+                "kept_decision_ids": reassignment.kept_decision_ids,
+                "depends_on": reassignment.depends_on,
+                "preview": reassignment_impact_preview(
+                    reassignment, decisions, ambiguity_windows
+                ),
+            }
+        )
+    return impacts
+
+
+def _reassignment_dependencies(
+    reassignments: list[Any], decisions: list[Any]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "reassignment_id": reassignment.reassignment_id,
+            "depends_on": reassignment.depends_on,
+            "depended_by": sorted(
+                decision.decision_id
+                for decision in decisions
+                if reassignment.reassignment_id in decision.depends_on
+            ),
+        }
+        for reassignment in reassignments
+    ]
+
+
+def _bone_length_deviation(
+    frames: list[Frame],
+    bone_lengths: dict[str, dict[str, float]],
+    start_frame: int,
+    end_frame: int,
+) -> float | None:
+    deviations: list[float] = []
+    for frame_index in range(start_frame, end_frame + 1):
+        if not 0 <= frame_index < len(frames):
+            continue
+        frame = frames[frame_index]
+        people = {split_marker(marker)[0] for marker in frame}
+        for bone_name, constraint in bone_lengths.items():
+            start_joint, end_joint = _bone_parts(bone_name)
+            for person_id in people:
+                prefix = "" if person_id is None else f"{person_id}_"
+                start = frame.get(f"{prefix}{start_joint}")
+                end = frame.get(f"{prefix}{end_joint}")
+                if start is None or end is None:
+                    continue
+                deviations.append(abs(distance(start, end) - constraint["length"]))
+    if not deviations:
+        return None
+    return sum(deviations) / len(deviations)
+
+
+def _unresolved_intervals(
+    statuses: list[dict[str, MarkerStatus]],
+    identity_statuses: list[dict[str, str]],
+) -> list[dict[str, int]]:
+    intervals: list[dict[str, int]] = []
+    start: int | None = None
+    for frame_index, frame_statuses in enumerate(statuses):
+        unresolved = any(status == "uncertain" for status in frame_statuses.values())
+        if not unresolved and frame_index < len(identity_statuses):
+            unresolved = any(
+                status == "ambiguous"
+                for status in identity_statuses[frame_index].values()
+            )
+        if unresolved and start is None:
+            start = frame_index
+        elif not unresolved and start is not None:
+            intervals.append({"start_frame": start, "end_frame": frame_index - 1})
+            start = None
+    if start is not None:
+        intervals.append({"start_frame": start, "end_frame": len(statuses) - 1})
+    return intervals
+
+
+def _pose_comparisons(
+    reassignments: list[Any],
+    based_on: ProcessingVersion,
+    frames: list[Frame],
+    statuses: list[dict[str, MarkerStatus]],
+    identity_statuses: list[dict[str, str]],
+    calibration: dict[str, Any],
+) -> list[dict[str, Any]]:
+    comparisons = []
+    for reassignment in reassignments:
+        if reassignment.status != "applied":
+            continue
+        start, end = reassignment.start_frame, reassignment.end_frame
+        comparisons.append(
+            {
+                "reassignment_id": reassignment.reassignment_id,
+                "start_frame": start,
+                "end_frame": end,
+                "bone_deviation_before": _bone_length_deviation(
+                    based_on.frames, calibration["bone_lengths"], start, end
+                ),
+                "bone_deviation_after": _bone_length_deviation(
+                    frames, calibration["bone_lengths"], start, end
+                ),
+                "unresolved_intervals_before": _unresolved_intervals(
+                    based_on.statuses, based_on.identity_statuses
+                ),
+                "unresolved_intervals_after": _unresolved_intervals(
+                    statuses, identity_statuses
+                ),
+            }
+        )
+    return comparisons
 
 
 def _decision_windows(decisions: list[Any]) -> list[dict[str, Any]]:
@@ -391,26 +538,53 @@ def reconstruct(
     max_gap_frames: int = 5,
     revisions: list[IdentityRevision] | None = None,
     decisions: list[Any] | None = None,
+    reassignments: list[Any] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
     decisions = decisions or []
-    revisions = revisions or decisions_to_revisions(decisions)
+    reassignments = reassignments or []
+    applied_reassignments, reassignment_disputes, disputed_ids = resolve_reassignments(
+        reassignments
+    )
+    pending = pending_confirmations(decisions, reassignments, applied_reassignments)
+    pending_ids = {item["decision_id"] for item in pending}
+    effective_decisions = [
+        decision
+        for decision in decisions
+        if decision.decision_id not in pending_ids
+    ]
+    if revisions is None:
+        revisions = decisions_to_revisions(
+            effective_decisions
+        ) + reassignments_to_revisions(applied_reassignments)
     ambiguity_windows = ambiguity_windows or []
-    _accepted, conflicts = resolve_decisions(decisions)
+    _accepted, conflicts = resolve_decisions(effective_decisions)
     corrected, changed = remap_identities(observations, revisions)
+    confirmed_ranges = [
+        (reassignment_markers(reassignment), reassignment.start_frame, reassignment.end_frame)
+        for reassignment in applied_reassignments
+    ]
     identity_statuses = initial_identity_statuses(
-        observations, ambiguity_windows, decisions
+        observations, ambiguity_windows, effective_decisions, confirmed_ranges
     )
     decision_parameters = {
-        "decision_impacts": _decision_impacts(decisions, conflicts),
+        "decision_impacts": _decision_impacts(decisions, conflicts, pending_ids),
         "decision_conflicts": conflicts,
-        "decision_windows": _decision_windows(decisions),
+        "decision_windows": _decision_windows(effective_decisions),
+        "pending_confirmations": pending,
+        "reassignment_impacts": _reassignment_impacts(
+            reassignments, decisions, ambiguity_windows, reassignment_disputes, disputed_ids
+        ),
+        "reassignment_disputes": reassignment_disputes,
+        "reassignment_dependencies": _reassignment_dependencies(
+            reassignments, decisions
+        ),
     }
 
-    decision_window = _decision_window(decisions, revisions, len(observations))
-    if based_on is not None and decision_window is not None:
-        start, end = decision_window
+    review_window = _review_window(decisions, revisions, reassignments, len(observations))
+    if based_on is not None and review_window is not None:
+        start, end = review_window
         frames = [dict(frame) for frame in based_on.frames]
         statuses = [dict(status) for status in based_on.statuses]
         window_observations = corrected[start : end + 1]
@@ -439,6 +613,14 @@ def reconstruct(
             "restored_ambiguities": _restored_ambiguities(
                 based_on.identity_statuses, identity_statuses
             ),
+            "pose_comparison": _pose_comparisons(
+                applied_reassignments,
+                based_on,
+                frames,
+                statuses,
+                identity_statuses,
+                calibration,
+            ),
             **decision_parameters,
         }
         version = _next_version(based_on.version)
@@ -450,6 +632,7 @@ def reconstruct(
             "recompute_window": None,
             "ambiguity_windows": ambiguity_windows,
             "restored_ambiguities": [],
+            "pose_comparison": [],
             **decision_parameters,
         }
         version = "v001"
@@ -465,6 +648,7 @@ def reconstruct(
         statuses=statuses,
         revisions=revisions,
         decisions=decisions,
+        reassignments=reassignments,
         identity_statuses=identity_statuses,
         based_on=based_on.version if based_on else None,
     )
