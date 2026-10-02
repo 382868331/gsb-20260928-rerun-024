@@ -9,7 +9,9 @@ from typing import Any
 from .models import (
     Calibration,
     CaptureRecord,
+    ContactEvidence,
     IdentityDecision,
+    InterpretationScenario,
     ProcessingVersion,
     TrajectoryReassignment,
     utc_now,
@@ -253,6 +255,146 @@ class PlatformStore:
         path = self.processing_dir(action_name, pipeline_name) / "review_export.json"
         atomic_write_json(path, export)
         return path
+
+    def contacts_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "contacts"
+
+    def save_contact(
+        self, action_name: str, pipeline_name: str, contact: ContactEvidence
+    ) -> Path:
+        path = self.contacts_dir(action_name, pipeline_name) / f"{contact.contact_id}.json"
+        if path.exists():
+            raise FileExistsError(f"contact is immutable and already exists: {path}")
+        atomic_write_json(path, contact.to_dict())
+        return path
+
+    def revoke_contact(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        contact_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.contacts_dir(action_name, pipeline_name)
+        contact_path = directory / f"{contact_id}.json"
+        if not contact_path.exists():
+            raise FileNotFoundError(f"cannot revoke unknown contact: {contact_path}")
+        path = directory / f"{contact_id}.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"contact already revoked: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "contact_revocation",
+                "contact_id": contact_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_contacts(self, action_name: str, pipeline_name: str) -> list[dict[str, Any]]:
+        directory = self.contacts_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".revocation.json")]
+            for path in directory.glob("*.revocation.json")
+        }
+        contacts: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".revocation.json"):
+                continue
+            data = read_json(path)
+            if data["contact_id"] in revoked:
+                data["status"] = "revoked"
+            contacts.append(data)
+        return contacts
+
+    def scenarios_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "scenarios"
+
+    def save_scenario(
+        self, action_name: str, pipeline_name: str, scenario: InterpretationScenario
+    ) -> Path:
+        path = (
+            self.scenarios_dir(action_name, pipeline_name) / f"{scenario.scenario_id}.json"
+        )
+        if path.exists():
+            raise FileExistsError(f"scenario is immutable and already exists: {path}")
+        atomic_write_json(path, scenario.to_dict())
+        return path
+
+    def adopt_scenario(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        scenario_id: str,
+        reason: str = "",
+    ) -> Path:
+        return self._resolve_scenario(
+            action_name, pipeline_name, scenario_id, "adoption", reason
+        )
+
+    def exclude_scenario(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        scenario_id: str,
+        reason: str = "",
+    ) -> Path:
+        return self._resolve_scenario(
+            action_name, pipeline_name, scenario_id, "exclusion", reason
+        )
+
+    def _resolve_scenario(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        scenario_id: str,
+        kind: str,
+        reason: str,
+    ) -> Path:
+        directory = self.scenarios_dir(action_name, pipeline_name)
+        base_path = directory / f"{scenario_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot resolve unknown scenario: {base_path}")
+        path = directory / f"{scenario_id}.{kind}.json"
+        if path.exists():
+            raise FileExistsError(f"scenario already {kind}: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": f"scenario_{kind}",
+                "scenario_id": scenario_id,
+                "reason": reason,
+                "resolved_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_scenarios(self, action_name: str, pipeline_name: str) -> list[dict[str, Any]]:
+        directory = self.scenarios_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        resolutions: dict[str, dict[str, Any]] = {}
+        for path in sorted(directory.glob("*.adoption.json")):
+            data = read_json(path)
+            resolutions[data["scenario_id"]] = {"status": "adopted", **data}
+        for path in sorted(directory.glob("*.exclusion.json")):
+            data = read_json(path)
+            resolutions[data["scenario_id"]] = {"status": "excluded", **data}
+        scenarios: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith((".adoption.json", ".exclusion.json")):
+                continue
+            data = read_json(path)
+            resolution = resolutions.get(data["scenario_id"])
+            if resolution is not None:
+                data["status"] = resolution["status"]
+                data["resolution_reason"] = resolution["reason"]
+            scenarios.append(data)
+        return scenarios
 
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:

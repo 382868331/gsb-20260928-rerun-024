@@ -13,6 +13,8 @@ def build_review_export(
     processing: dict[str, Any],
     decisions: list[Any],
     reassignments: list[Any],
+    contacts: list[Any] | None = None,
+    scenarios: list[Any] | None = None,
 ) -> dict[str, Any]:
     impacts = {
         item["decision_id"]: item["status"]
@@ -31,9 +33,38 @@ def build_review_export(
             "frame_count": capture["frame_count"],
             "frame_rate": capture["frame_rate"],
             "markers": capture["markers"],
+            "objects": capture.get("objects", []),
             "observations": capture["observations"],
+            "object_frames": capture.get("object_frames", []),
         },
         "processing_version": processing["version"],
+        "contact_evidence": [
+            {
+                "contact_id": contact.contact_id,
+                "person_id": contact.person_id,
+                "joint": contact.joint,
+                "object_id": contact.object_id,
+                "start_frame": contact.start_frame,
+                "end_frame": contact.end_frame,
+                "source": contact.source,
+                "status": contact.status,
+                "reason": contact.reason,
+            }
+            for contact in (contacts or [])
+        ],
+        "identity_scenarios": [
+            {
+                "scenario_id": scenario.scenario_id,
+                "label": scenario.label,
+                "status": scenario.status,
+                "decision_ids": scenario.decision_ids,
+                "reassignment_ids": scenario.reassignment_ids,
+                "contact_ids": scenario.contact_ids,
+                "excluded_candidates": scenario.excluded_candidates,
+                "reason": scenario.reason,
+            }
+            for scenario in (scenarios or [])
+        ],
         "reassignment_ranges": [
             {
                 "reassignment_id": reassignment.reassignment_id,

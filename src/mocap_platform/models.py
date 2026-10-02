@@ -21,6 +21,8 @@ class CaptureRecord:
     markers: list[str]
     observed_frames: list[Frame]
     ground_truth_frames: list[Frame] = field(default_factory=list)
+    objects: list[str] = field(default_factory=list)
+    object_frames: list[Frame] = field(default_factory=list)
     source: str = "manual"
     notes: str = ""
     created_at: str = field(default_factory=utc_now)
@@ -34,10 +36,12 @@ class CaptureRecord:
             "frame_count": self.frame_count,
             "frame_rate": self.frame_rate,
             "markers": self.markers,
+            "objects": self.objects,
             "source": self.source,
             "notes": self.notes,
             "created_at": self.created_at,
             "observations": self.observed_frames,
+            "object_frames": self.object_frames,
             "ground_truth": self.ground_truth_frames,
         }
 
@@ -154,6 +158,66 @@ IdentityStatus = Literal["certain", "confirmed", "ambiguous"]
 
 
 @dataclass
+class ContactEvidence:
+    contact_id: str
+    person_id: str
+    joint: str
+    object_id: str
+    start_frame: int
+    end_frame: int
+    reason: str
+    source: str = "manual_review"
+    tolerance: float = 0.2
+    depends_on: list[str] = field(default_factory=list)
+    status: Literal["active", "revoked"] = "active"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contact_id": self.contact_id,
+            "person_id": self.person_id,
+            "joint": self.joint,
+            "object_id": self.object_id,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "tolerance": self.tolerance,
+            "source": self.source,
+            "reason": self.reason,
+            "depends_on": self.depends_on,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class InterpretationScenario:
+    scenario_id: str
+    label: str
+    reason: str
+    decision_ids: list[str] = field(default_factory=list)
+    reassignment_ids: list[str] = field(default_factory=list)
+    contact_ids: list[str] = field(default_factory=list)
+    excluded_candidates: list[dict[str, str]] = field(default_factory=list)
+    status: Literal["open", "adopted", "excluded"] = "open"
+    resolution_reason: str = ""
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "label": self.label,
+            "reason": self.reason,
+            "decision_ids": self.decision_ids,
+            "reassignment_ids": self.reassignment_ids,
+            "contact_ids": self.contact_ids,
+            "excluded_candidates": self.excluded_candidates,
+            "status": self.status,
+            "resolution_reason": self.resolution_reason,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
 class ProcessingVersion:
     action_name: str
     pipeline_name: str
@@ -166,6 +230,7 @@ class ProcessingVersion:
     revisions: list[IdentityRevision] = field(default_factory=list)
     decisions: list[IdentityDecision] = field(default_factory=list)
     reassignments: list["TrajectoryReassignment"] = field(default_factory=list)
+    contacts: list["ContactEvidence"] = field(default_factory=list)
     identity_statuses: list[dict[str, IdentityStatus]] = field(default_factory=list)
     based_on: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -186,6 +251,7 @@ class ProcessingVersion:
             "trajectory_reassignments": [
                 reassignment.to_dict() for reassignment in self.reassignments
             ],
+            "contact_evidence": [contact.to_dict() for contact in self.contacts],
             "frames": self.frames,
             "statuses": self.statuses,
             "identity_statuses": self.identity_statuses,

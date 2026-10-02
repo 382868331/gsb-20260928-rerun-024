@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
+from .contact import contact_assessments, simultaneous_contacts
 from .identity import (
     decision_affected_markers,
     decision_trajectories,
@@ -539,15 +540,26 @@ def reconstruct(
     revisions: list[IdentityRevision] | None = None,
     decisions: list[Any] | None = None,
     reassignments: list[Any] | None = None,
+    contacts: list[Any] | None = None,
+    object_frames: list[Frame] | None = None,
+    scenario_assessments: list[dict[str, Any]] | None = None,
+    review_annotations: dict[str, Any] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
     decisions = decisions or []
     reassignments = reassignments or []
+    contacts = contacts or []
+    object_frames = object_frames or []
     applied_reassignments, reassignment_disputes, disputed_ids = resolve_reassignments(
         reassignments
     )
-    pending = pending_confirmations(decisions, reassignments, applied_reassignments)
+    revoked_contact_ids = {
+        contact.contact_id for contact in contacts if contact.status == "revoked"
+    }
+    pending = pending_confirmations(
+        decisions, reassignments, applied_reassignments, revoked_contact_ids
+    )
     pending_ids = {item["decision_id"] for item in pending}
     effective_decisions = [
         decision
@@ -581,6 +593,20 @@ def reconstruct(
             reassignments, decisions
         ),
     }
+
+    def _contact_parameters(
+        frames: list[Frame], statuses: list[dict[str, MarkerStatus]]
+    ) -> dict[str, Any]:
+        return {
+            "contact_review": {
+                "assessments": contact_assessments(
+                    contacts, frames, statuses, object_frames
+                ),
+                "simultaneous_contacts": simultaneous_contacts(contacts),
+            },
+            "scenario_assessments": scenario_assessments or [],
+            "review_annotations": review_annotations or {},
+        }
 
     review_window = _review_window(decisions, revisions, reassignments, len(observations))
     if based_on is not None and review_window is not None:
@@ -622,6 +648,7 @@ def reconstruct(
                 calibration,
             ),
             **decision_parameters,
+            **_contact_parameters(frames, statuses),
         }
         version = _next_version(based_on.version)
     else:
@@ -634,6 +661,7 @@ def reconstruct(
             "restored_ambiguities": [],
             "pose_comparison": [],
             **decision_parameters,
+            **_contact_parameters(frames, statuses),
         }
         version = "v001"
 
@@ -649,6 +677,7 @@ def reconstruct(
         revisions=revisions,
         decisions=decisions,
         reassignments=reassignments,
+        contacts=contacts,
         identity_statuses=identity_statuses,
         based_on=based_on.version if based_on else None,
     )

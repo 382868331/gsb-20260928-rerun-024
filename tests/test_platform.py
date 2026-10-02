@@ -489,6 +489,228 @@ class PlatformIntegrationTest(unittest.TestCase):
                 )
             )
 
+    def test_contact_evidence_scenarios_recheck_and_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "contact_evidence_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v1, v2, v3, v4 = (load(v) for v in ("v001", "v002", "v003", "v004"))
+
+            # Contact comparison separates incompatible, missing, and unobserved.
+            baseline = {
+                item["contact_id"]: item
+                for item in v1["parameters"]["contact_review"]["assessments"]
+            }
+            wrist = baseline["contact_001_p0_left_wrist_crate"]
+            self.assertEqual(wrist["status"], "incompatible")
+            self.assertEqual(
+                wrist["conflict_intervals"], [{"start_frame": 20, "end_frame": 20}]
+            )
+            self.assertEqual(wrist["missing_frames"], [21, 22])
+            self.assertTrue(wrist["used_observations"])
+            self.assertNotIn(
+                21, [item["frame"] for item in wrist["used_observations"]]
+            )
+            self.assertEqual(
+                baseline["contact_003_p0_right_ankle_crate"]["status"], "unobserved"
+            )
+            self.assertEqual(
+                baseline["contact_003_p0_right_ankle_crate"]["missing_frames"],
+                [26, 27, 28],
+            )
+
+            # The contact-consistent reassignment makes the contact compatible.
+            reassigned = {
+                item["contact_id"]: item
+                for item in v2["parameters"]["contact_review"]["assessments"]
+            }
+            self.assertEqual(
+                reassigned["contact_001_p0_left_wrist_crate"]["status"], "compatible"
+            )
+            self.assertEqual(
+                reassigned["contact_002_p1_right_wrist_crate"]["missing_frames"],
+                [26, 27, 28],
+            )
+            # Simultaneous contact with one object by two people is allowed.
+            simultaneous = v2["parameters"]["contact_review"]["simultaneous_contacts"]
+            shared = [
+                item
+                for item in simultaneous
+                if item["contact_ids"]
+                == [
+                    "contact_001_p0_left_wrist_crate",
+                    "contact_002_p1_right_wrist_crate",
+                ]
+            ]
+            self.assertEqual(len(shared), 1)
+            self.assertTrue(shared[0]["allowed"])
+            self.assertEqual(
+                (shared[0]["start_frame"], shared[0]["end_frame"]), (23, 24)
+            )
+
+            # Scenarios keep alternative explanations with distinct outcomes.
+            scenarios = {
+                item["scenario_id"]: item
+                for item in v3["parameters"]["scenario_assessments"]
+            }
+            self.assertEqual(
+                scenarios["scenario_a_reassigned_contact"]["automatic_assessment"],
+                "compatible",
+            )
+            self.assertEqual(
+                scenarios["scenario_b_no_reassignment"]["automatic_assessment"],
+                "incompatible",
+            )
+            self.assertEqual(
+                scenarios["scenario_c_duplicate_claim"]["automatic_assessment"],
+                "contested",
+            )
+            claims = scenarios["scenario_c_duplicate_claim"][
+                "trajectory_claim_conflicts"
+            ]
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0]["markers"], ["p1_r_wrist"])
+            self.assertEqual(
+                (claims[0]["start_frame"], claims[0]["end_frame"]), (22, 26)
+            )
+            self.assertIn("never counts", scenarios["scenario_a_reassigned_contact"]["note"])
+
+            # Revoking one contact re-pends only dependent confirmations and
+            # re-checks only scenarios that rely on that contact.
+            pending = v4["parameters"]["pending_confirmations"]
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(
+                pending[0]["decision_id"], "contact_decision_001_confirm_p0_right_ankle"
+            )
+            self.assertEqual(pending[0]["reason"], "contact_revoked")
+            self.assertEqual(
+                pending[0]["dependencies"], ["contact_002_p1_right_wrist_crate"]
+            )
+            recheck = v4["parameters"]["review_annotations"]["contact_recheck"]
+            self.assertEqual(
+                recheck["rechecked_scenarios"], ["scenario_a_reassigned_contact"]
+            )
+            self.assertEqual(
+                recheck["unaffected_scenarios"],
+                ["scenario_b_no_reassignment", "scenario_c_duplicate_claim"],
+            )
+            reassessed = {
+                item["scenario_id"]: item
+                for item in v4["parameters"]["scenario_assessments"]
+            }
+            self.assertEqual(list(reassessed), ["scenario_a_reassigned_contact"])
+            reassessed_contacts = {
+                item["contact_id"]: item["status"]
+                for item in reassessed["scenario_a_reassigned_contact"][
+                    "contact_assessments"
+                ]
+            }
+            self.assertNotIn("contact_002_p1_right_wrist_crate", reassessed_contacts)
+            self.assertEqual(
+                reassessed_contacts["contact_001_p0_left_wrist_crate"], "compatible"
+            )
+
+            # Contacts and scenarios persist immutably and reload with status.
+            contacts = store.load_contacts(action, pipeline)
+            self.assertEqual(len(contacts), 3)
+            statuses = {item["contact_id"]: item["status"] for item in contacts}
+            self.assertEqual(statuses["contact_002_p1_right_wrist_crate"], "revoked")
+            self.assertEqual(statuses["contact_001_p0_left_wrist_crate"], "active")
+            from mocap_platform.models import ContactEvidence, InterpretationScenario
+
+            with self.assertRaises(FileExistsError):
+                store.save_contact(
+                    action,
+                    pipeline,
+                    ContactEvidence(
+                        contact_id="contact_001_p0_left_wrist_crate",
+                        person_id="p0",
+                        joint="l_wrist",
+                        object_id="obj_crate",
+                        start_frame=18,
+                        end_frame=24,
+                        reason="attempted overwrite",
+                    ),
+                )
+            with self.assertRaises(FileExistsError):
+                store.revoke_contact(
+                    action, pipeline, "contact_002_p1_right_wrist_crate"
+                )
+            with self.assertRaises(FileNotFoundError):
+                store.revoke_contact(action, pipeline, "contact_999_missing")
+
+            scenarios_loaded = store.load_scenarios(action, pipeline)
+            scenario_statuses = {
+                item["scenario_id"]: item["status"] for item in scenarios_loaded
+            }
+            self.assertEqual(scenario_statuses["scenario_a_reassigned_contact"], "adopted")
+            self.assertEqual(scenario_statuses["scenario_b_no_reassignment"], "excluded")
+            self.assertEqual(scenario_statuses["scenario_c_duplicate_claim"], "open")
+            with self.assertRaises(FileExistsError):
+                store.save_scenario(
+                    action,
+                    pipeline,
+                    InterpretationScenario(
+                        scenario_id="scenario_a_reassigned_contact",
+                        label="attempted overwrite",
+                        reason="attempted overwrite",
+                    ),
+                )
+            with self.assertRaises(FileExistsError):
+                store.adopt_scenario(action, pipeline, "scenario_a_reassigned_contact")
+            with self.assertRaises(FileNotFoundError):
+                store.adopt_scenario(action, pipeline, "scenario_999_missing")
+
+            # The export keeps observations, contact annotations, and candidate
+            # adoption or exclusion with reasons.
+            export = json.loads(
+                base.joinpath("review_export.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(export["capture_id"], "demo_capture_0004")
+            capture = store.load_capture("demo_capture_0004")
+            self.assertEqual(
+                export["original_capture"]["observations"], capture["observations"]
+            )
+            self.assertEqual(
+                export["original_capture"]["object_frames"], capture["object_frames"]
+            )
+            self.assertEqual(export["original_capture"]["objects"], ["obj_crate"])
+            evidence = {
+                item["contact_id"]: item for item in export["contact_evidence"]
+            }
+            self.assertEqual(
+                evidence["contact_002_p1_right_wrist_crate"]["status"], "revoked"
+            )
+            self.assertTrue(
+                all(item["source"] == "manual_review" for item in evidence.values())
+            )
+            exported_scenarios = {
+                item["scenario_id"]: item for item in export["identity_scenarios"]
+            }
+            self.assertEqual(
+                exported_scenarios["scenario_a_reassigned_contact"]["status"], "adopted"
+            )
+            self.assertEqual(
+                exported_scenarios["scenario_b_no_reassignment"]["status"], "excluded"
+            )
+            self.assertEqual(
+                exported_scenarios["scenario_c_duplicate_claim"]["status"], "open"
+            )
+            self.assertEqual(
+                exported_scenarios["scenario_a_reassigned_contact"]["reassignment_ids"],
+                ["contact_reassign_001_p1_right_arm_to_p0"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

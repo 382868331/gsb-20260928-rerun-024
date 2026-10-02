@@ -112,15 +112,30 @@ def pending_confirmations(
     decisions: list[IdentityDecision],
     reassignments: list[TrajectoryReassignment],
     applied: list[TrajectoryReassignment],
+    revoked_contact_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     revoked_ids = {
         reassignment.reassignment_id
         for reassignment in reassignments
         if reassignment.status == "revoked"
     }
+    revoked_contact_ids = revoked_contact_ids or set()
     pending: list[dict[str, Any]] = []
     for decision in decisions:
         if decision.status != "active":
+            continue
+        revoked_contacts = sorted(set(decision.depends_on) & revoked_contact_ids)
+        if revoked_contacts:
+            pending.append(
+                {
+                    "decision_id": decision.decision_id,
+                    "reason": "contact_revoked",
+                    "dependencies": revoked_contacts,
+                    "start_frame": decision.start_frame,
+                    "end_frame": decision.end_frame,
+                    "markers": sorted(decision_affected_markers(decision)),
+                }
+            )
             continue
         revoked_dependencies = sorted(set(decision.depends_on) & revoked_ids)
         if revoked_dependencies:

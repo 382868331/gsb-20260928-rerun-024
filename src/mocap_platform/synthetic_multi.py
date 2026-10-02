@@ -237,3 +237,119 @@ def inject_scoped_review_events(
         }
     )
     return observed, events, ambiguity_windows
+
+
+CONTACT_OBJECT = "obj_crate"
+CONTACT_START = 18
+CONTACT_END = 24
+SHARED_CONTACT_START = 23
+SHARED_CONTACT_END = 25
+OBJECT_GAP_START = 26
+OBJECT_GAP_END = 28
+OBJECT_MOVE_END = 38
+
+
+def contact_object_track(
+    truth: list[dict[str, list[float]]],
+) -> list[dict[str, list[float] | None]]:
+    track: list[dict[str, list[float] | None]] = [{} for _ in truth]
+    anchor = truth[CONTACT_START][person_marker("p0", "l_wrist")]
+    for frame_index in range(15, CONTACT_START):
+        t = (frame_index - 14) / (CONTACT_START - 14)
+        track[frame_index][CONTACT_OBJECT] = [
+            anchor[axis] + (1.0 - t) * 0.4 for axis in range(3)
+        ]
+    for frame_index in range(CONTACT_START, SHARED_CONTACT_START):
+        track[frame_index][CONTACT_OBJECT] = list(
+            truth[frame_index][person_marker("p0", "l_wrist")]
+        )
+    for frame_index in range(SHARED_CONTACT_START, SHARED_CONTACT_END + 1):
+        first = truth[frame_index][person_marker("p0", "l_wrist")]
+        second = truth[frame_index][person_marker("p1", "r_wrist")]
+        track[frame_index][CONTACT_OBJECT] = [
+            (first[axis] + second[axis]) / 2 for axis in range(3)
+        ]
+    # Frames 26-28 stay unobserved: the object track itself has a missing segment.
+    last = track[SHARED_CONTACT_END][CONTACT_OBJECT]
+    for frame_index in range(OBJECT_GAP_END + 1, OBJECT_MOVE_END + 1):
+        step = frame_index - SHARED_CONTACT_END
+        track[frame_index][CONTACT_OBJECT] = [
+            last[0] + 0.12 * step,
+            last[1],
+            last[2] + 0.06 * step,
+        ]
+    return track
+
+
+def inject_contact_review_events(
+    truth: list[dict[str, list[float]]],
+) -> tuple[
+    list[dict[str, list[float] | None]],
+    list[dict[str, list[float] | None]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    observed: list[dict[str, list[float] | None]] = copy.deepcopy(truth)
+    events: list[dict[str, Any]] = []
+
+    for frame_index in range(CROSSING_START, CROSSING_END + 1):
+        for left_joint, right_joint in zip(ARM_MARKERS, OPPOSITE_ARM_MARKERS):
+            first = person_marker("p0", left_joint)
+            second = person_marker("p1", right_joint)
+            observed[frame_index][first], observed[frame_index][second] = (
+                observed[frame_index][second],
+                observed[frame_index][first],
+            )
+    events.append(
+        {
+            "type": "identity_swap",
+            "markers": [
+                *[person_marker("p0", marker) for marker in ARM_MARKERS],
+                *[person_marker("p1", marker) for marker in OPPOSITE_ARM_MARKERS],
+            ],
+            "start_frame": CROSSING_START,
+            "end_frame": CROSSING_END,
+        }
+    )
+
+    for frame_index in range(21, 23):
+        observed[frame_index][person_marker("p0", "l_wrist")] = None
+    events.append(
+        {
+            "type": "short_occlusion",
+            "marker": person_marker("p0", "l_wrist"),
+            "start_frame": 21,
+            "end_frame": 22,
+        }
+    )
+
+    object_frames = contact_object_track(truth)
+    events.extend(
+        [
+            {
+                "type": "moving_contact_object",
+                "object_id": CONTACT_OBJECT,
+                "start_frame": 15,
+                "end_frame": OBJECT_MOVE_END,
+            },
+            {
+                "type": "object_observation_gap",
+                "object_id": CONTACT_OBJECT,
+                "start_frame": OBJECT_GAP_START,
+                "end_frame": OBJECT_GAP_END,
+            },
+        ]
+    )
+
+    ambiguity_windows = [
+        {
+            "start_frame": CROSSING_START,
+            "end_frame": CROSSING_END,
+            "markers": [
+                *[person_marker("p0", marker) for marker in ARM_MARKERS],
+                *[person_marker("p1", marker) for marker in OPPOSITE_ARM_MARKERS],
+            ],
+            "reason": "two people cross while both touch the same moving object",
+        },
+    ]
+    return observed, object_frames, events, ambiguity_windows
