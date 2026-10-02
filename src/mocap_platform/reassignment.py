@@ -118,11 +118,18 @@ def pending_confirmations(
         for reassignment in reassignments
         if reassignment.status == "revoked"
     }
+    revoked_decision_ids = {
+        decision.decision_id
+        for decision in decisions
+        if decision.status == "revoked"
+    }
     pending: list[dict[str, Any]] = []
     for decision in decisions:
         if decision.status != "active":
             continue
-        revoked_dependencies = sorted(set(decision.depends_on) & revoked_ids)
+        revoked_dependencies = sorted(
+            set(decision.depends_on) & (revoked_ids | revoked_decision_ids)
+        )
         if revoked_dependencies:
             pending.append(
                 {

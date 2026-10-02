@@ -8,6 +8,8 @@ from pathlib import Path
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
 from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
+from mocap_platform.contact import candidates_dependent_on
+from mocap_platform.models import IdentityCandidate
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -18,6 +20,34 @@ from mocap_platform.synthetic_multi import (
 
 
 class PlatformIntegrationTest(unittest.TestCase):
+    def test_candidate_recheck_follows_revoked_evidence_and_decisions(self) -> None:
+        candidate = IdentityCandidate(
+            candidate_id="candidate_001",
+            person_id="p0",
+            joint_mapping={"l_wrist": "p1_r_wrist"},
+            start_frame=20,
+            end_frame=29,
+            depends_on=["contact_001", "decision_001", "reassignment_001"],
+        )
+        self.assertEqual(
+            candidates_dependent_on(
+                [candidate],
+                revoked_contact_ids=set(),
+                revoked_reassignment_ids=set(),
+                revoked_decision_ids={"decision_001"},
+            ),
+            ["candidate_001"],
+        )
+        self.assertEqual(
+            candidates_dependent_on(
+                [candidate],
+                revoked_contact_ids={"contact_999"},
+                revoked_reassignment_ids={"reassignment_999"},
+                revoked_decision_ids=set(),
+            ),
+            [],
+        )
+
     def test_scoped_confirmation_conflicts_revocation_and_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             demo(directory)
@@ -487,6 +517,193 @@ class PlatformIntegrationTest(unittest.TestCase):
                     item["source"] == "manual_review"
                     for item in provenance.values()
                 )
+            )
+
+    def test_contact_evidence_schemes_simultaneous_contact_and_targeted_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "contact_evidence_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v1, v2, v3 = load("v001"), load("v002"), load("v003")
+            schemes = {
+                item["scheme_id"]: item
+                for item in v2["parameters"]["scheme_reviews"]
+            }
+            results = {
+                item["contact_id"]: item
+                for item in v2["parameters"]["contact_review"]["contact_results"]
+            }
+
+            # Raw observed gaps stay missing and are explicitly itemized.
+            self.assertEqual(
+                v2["parameters"]["object_missing_intervals"]["ball_01"],
+                [
+                    {"start_frame": 22, "end_frame": 23},
+                    {"start_frame": 27, "end_frame": 27},
+                ],
+            )
+            short_contact = results[
+                "contact_005_p1_hand_behind_ball_short_occlusion"
+            ]
+            self.assertEqual(short_contact["verdict"], "unobserved")
+            self.assertEqual(short_contact["missing_observation_frames"], [22, 23])
+            self.assertEqual(short_contact["observations_used"], [])
+
+            # The swap interpretation follows the ball during the crossing.
+            swap_contact = results[
+                "contact_001_p0_left_hand_ball_during_crossing"
+            ]
+            self.assertEqual(swap_contact["verdict"], "still_plausible")
+            self.assertEqual(swap_contact["observed_marker"], "p1_r_wrist")
+            self.assertEqual(swap_contact["missing_observation_frames"], [27])
+            self.assertTrue(swap_contact["supported_frames"])
+            self.assertTrue(
+                all(
+                    item["observed_marker"] in {"p0_l_wrist", "p1_r_wrist"}
+                    for item in swap_contact["observations_used"]
+                )
+            )
+
+            # Independent schemes get independent geometric verdicts.
+            swap_scheme = schemes["scheme_001_arm_swap"]
+            keep_scheme = schemes["scheme_002_keep_labels"]
+            self.assertEqual(swap_scheme["disputed_contact_intervals"], [])
+            self.assertEqual(
+                keep_scheme["disputed_contact_intervals"],
+                [
+                    {"start_frame": 25, "end_frame": 26},
+                    {"start_frame": 28, "end_frame": 29},
+                ],
+            )
+            keep_results = {
+                item["contact_id"]: item
+                for item in keep_scheme["contact_review"]["contact_results"]
+            }
+            self.assertEqual(
+                keep_results[
+                    "contact_001_p0_left_hand_ball_during_crossing"
+                ]["verdict"],
+                "geometrically_incompatible",
+            )
+            self.assertEqual(
+                keep_results[
+                    "contact_001_p0_left_hand_ball_during_crossing"
+                ]["observed_marker"],
+                "p0_l_wrist",
+            )
+
+            # Two people can touch the same object on the same frame.
+            simultaneous = v2["parameters"]["contact_review"]["simultaneous_contacts"]
+            self.assertEqual(len(simultaneous), 1)
+            self.assertEqual(simultaneous[0]["frame"], 24)
+            self.assertEqual(simultaneous[0]["object_id"], "ball_01")
+            self.assertEqual(
+                simultaneous[0]["contacts"],
+                [
+                    "contact_001_p0_left_hand_ball_during_crossing",
+                    "contact_002_p1_left_hand_ball_during_grasp",
+                ],
+            )
+
+            # The same body track still cannot be claimed by two identities.
+            double_scheme = schemes["scheme_003_double_claim"]
+            self.assertEqual(
+                double_scheme["claim_conflict_intervals"],
+                [{"start_frame": 22, "end_frame": 26}],
+            )
+            self.assertTrue(v2["parameters"]["contact_review"]["claim_conflicts"])
+
+            # An automatic recommendation is retained as evidence but not confirmed.
+            automatic = results["contact_004_automatic_near_object_hint"]
+            self.assertEqual(automatic["source"], "automatic_recommendation")
+            self.assertEqual(automatic["verdict"], "geometrically_incompatible")
+            self.assertNotIn("contact_004_automatic_near_object_hint", v2["identity_decisions"])
+
+            # Withdrawing one contact rechecks only dependent candidate/scheme.
+            self.assertEqual(
+                v3["parameters"]["contact_dependent_candidates"],
+                ["candidate_no_swap_keep_observed_labels"],
+            )
+            self.assertEqual(
+                v3["parameters"]["contact_dependent_schemes"],
+                ["scheme_002_keep_labels"],
+            )
+            v3_ids = {
+                item["contact_id"]
+                for item in v3["parameters"]["contact_review"]["contact_results"]
+            }
+            self.assertNotIn(
+                "contact_003_p0_left_hand_ball_after_separation", v3_ids
+            )
+            self.assertIn(
+                "contact_001_p0_left_hand_ball_during_crossing", v3_ids
+            )
+
+            # Evidence and independent schemes persist for reopened review.
+            contacts = store.load_contacts(action, pipeline)
+            contact_statuses = {
+                item["contact_id"]: item["status"] for item in contacts
+            }
+            self.assertEqual(
+                contact_statuses[
+                    "contact_003_p0_left_hand_ball_after_separation"
+                ],
+                "revoked",
+            )
+            self.assertEqual(
+                contact_statuses[
+                    "contact_001_p0_left_hand_ball_during_crossing"
+                ],
+                "active",
+            )
+            self.assertEqual(len(store.load_schemes(action, pipeline)), 3)
+            self.assertIn("ball_01", store.load_object_tracks(action, pipeline))
+
+            export = json.loads(
+                base.joinpath("review_export.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                export["original_capture"]["observations"],
+                store.load_capture("demo_capture_0003")["observations"],
+            )
+            self.assertEqual(
+                [item["contact_id"] for item in export["manual_contact_notes"]],
+                [item["contact_id"] for item in contacts],
+            )
+            exported_candidates = {
+                item["candidate_id"]: item for item in export["identity_candidates"]
+            }
+            self.assertEqual(
+                exported_candidates["candidate_swap_p0_left_is_p1_right_track"][
+                    "decision"
+                ],
+                "adopted",
+            )
+            self.assertEqual(
+                exported_candidates["candidate_no_swap_keep_observed_labels"][
+                    "decision"
+                ],
+                "excluded",
+            )
+            self.assertIn(
+                "geometrically incompatible",
+                exported_candidates["candidate_no_swap_keep_observed_labels"][
+                    "decision_reason"
+                ],
+            )
+            self.assertEqual(len(export["identity_schemes"]), 3)
+            self.assertEqual(
+                export["object_tracks"]["ball_01"]["positions"][27], None
             )
 
 

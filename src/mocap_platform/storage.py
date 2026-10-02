@@ -9,7 +9,11 @@ from typing import Any
 from .models import (
     Calibration,
     CaptureRecord,
+    ContactObservation,
     IdentityDecision,
+    IdentityCandidate,
+    IdentityScheme,
+    ObjectTrack,
     ProcessingVersion,
     TrajectoryReassignment,
     utc_now,
@@ -253,6 +257,164 @@ class PlatformStore:
         path = self.processing_dir(action_name, pipeline_name) / "review_export.json"
         atomic_write_json(path, export)
         return path
+
+    def objects_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "objects"
+
+    def save_object_track(
+        self, action_name: str, pipeline_name: str, obj: ObjectTrack
+    ) -> Path:
+        path = self.objects_dir(action_name, pipeline_name) / f"{obj.object_id}.json"
+        if path.exists():
+            raise FileExistsError(f"object track is immutable and already exists: {path}")
+        atomic_write_json(path, obj.to_dict())
+        return path
+
+    def load_object_tracks(
+        self, action_name: str, pipeline_name: str
+    ) -> dict[str, dict[str, Any]]:
+        directory = self.objects_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return {}
+        return {path.stem: read_json(path) for path in sorted(directory.glob("*.json"))}
+
+    def contacts_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "contacts"
+
+    def save_contact(
+        self, action_name: str, pipeline_name: str, contact: ContactObservation
+    ) -> Path:
+        path = self.contacts_dir(action_name, pipeline_name) / f"{contact.contact_id}.json"
+        if path.exists():
+            raise FileExistsError(f"contact observation is immutable and already exists: {path}")
+        atomic_write_json(path, contact.to_dict())
+        return path
+
+    def revoke_contact(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        contact_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.contacts_dir(action_name, pipeline_name)
+        contact_path = directory / f"{contact_id}.json"
+        if not contact_path.exists():
+            raise FileNotFoundError(f"cannot revoke unknown contact: {contact_path}")
+        path = directory / f"{contact_id}.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"contact already revoked: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "contact_revocation",
+                "contact_id": contact_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_contacts(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.contacts_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".revocation.json")]
+            for path in directory.glob("*.revocation.json")
+        }
+        contacts: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".revocation.json"):
+                continue
+            data = read_json(path)
+            if data["contact_id"] in revoked:
+                data["status"] = "revoked"
+            contacts.append(data)
+        return contacts
+
+    def candidates_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "candidates"
+
+    def save_candidate(
+        self, action_name: str, pipeline_name: str, candidate: IdentityCandidate
+    ) -> Path:
+        path = self.candidates_dir(action_name, pipeline_name) / f"{candidate.candidate_id}.json"
+        if path.exists():
+            raise FileExistsError(f"identity candidate is immutable and already exists: {path}")
+        atomic_write_json(path, candidate.to_dict())
+        return path
+
+    def record_candidate_decision(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        candidate_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.candidates_dir(action_name, pipeline_name)
+        base_path = directory / f"{candidate_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot decide unknown candidate: {base_path}")
+        path = directory / f"{candidate_id}.decision.json"
+        if path.exists():
+            raise FileExistsError(f"candidate decision already recorded: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "candidate_decision",
+                "candidate_id": candidate_id,
+                "decision": decision,
+                "reason": reason,
+                "decided_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_candidates(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.candidates_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        decisions = {
+            path.name[: -len(".decision.json")]: read_json(path)
+            for path in directory.glob("*.decision.json")
+        }
+        candidates: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".decision.json"):
+                continue
+            data = read_json(path)
+            if data["candidate_id"] in decisions:
+                decision_record = decisions[data["candidate_id"]]
+                data["decision"] = decision_record["decision"]
+                data["decision_reason"] = decision_record.get("reason", "")
+            candidates.append(data)
+        return candidates
+
+    def schemes_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "schemes"
+
+    def save_scheme(
+        self, action_name: str, pipeline_name: str, scheme: IdentityScheme
+    ) -> Path:
+        path = self.schemes_dir(action_name, pipeline_name) / f"{scheme.scheme_id}.json"
+        if path.exists():
+            raise FileExistsError(f"identity scheme is immutable and already exists: {path}")
+        atomic_write_json(path, scheme.to_dict())
+        return path
+
+    def load_schemes(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.schemes_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        return [read_json(path) for path in sorted(directory.glob("*.json"))]
 
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:

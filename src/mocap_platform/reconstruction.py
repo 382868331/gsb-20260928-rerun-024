@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any
 
+from .contact import (
+    candidates_dependent_on,
+    disputed_contact_intervals,
+    evaluate_contact_compatibility,
+    object_missing_intervals,
+    schemes_dependent_on,
+    unresolved_pose_intervals,
+)
 from .geometry import angle_between, cross, distance, dot, lerp, norm, normalize
 from .identity import (
     decision_affected_markers,
@@ -539,11 +548,19 @@ def reconstruct(
     revisions: list[IdentityRevision] | None = None,
     decisions: list[Any] | None = None,
     reassignments: list[Any] | None = None,
+    contact_observations: list[Any] | None = None,
+    identity_candidates: list[Any] | None = None,
+    contact_objects: dict[str, list[list[float] | None]] | None = None,
+    identity_schemes: list[Any] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
     decisions = decisions or []
     reassignments = reassignments or []
+    contact_observations = contact_observations or []
+    identity_candidates = identity_candidates or []
+    contact_objects = contact_objects or {}
+    identity_schemes = identity_schemes or []
     applied_reassignments, reassignment_disputes, disputed_ids = resolve_reassignments(
         reassignments
     )
@@ -582,7 +599,112 @@ def reconstruct(
         ),
     }
 
+    active_contacts = [
+        contact
+        for contact in contact_observations
+        if getattr(contact, "status", "active") == "active"
+    ]
+    revoked_contact_ids = {
+        contact.contact_id
+        for contact in contact_observations
+        if getattr(contact, "status", "active") == "revoked"
+    }
+    contact_review = evaluate_contact_compatibility(
+        active_contacts, identity_candidates, observations, contact_objects
+    )
+    contact_intervals = disputed_contact_intervals(contact_review)
+    dependent_candidate_ids = candidates_dependent_on(
+        identity_candidates,
+        revoked_contact_ids,
+        {
+            reassignment.reassignment_id
+            for reassignment in reassignments
+            if reassignment.status == "revoked"
+        },
+        {
+            decision.decision_id
+            for decision in decisions
+            if decision.status == "revoked"
+        },
+    )
+    dependent_scheme_ids = schemes_dependent_on(
+        identity_schemes, set(dependent_candidate_ids)
+    )
+    def _scheme_review(scheme: Any) -> dict[str, Any]:
+        scheme_candidates = [
+            replace(candidate, decision="open")
+            for candidate in identity_candidates
+            if candidate.candidate_id in set(scheme.candidate_ids)
+        ]
+        scheme_contact_review = evaluate_contact_compatibility(
+            active_contacts, scheme_candidates, observations, contact_objects
+        )
+        scheme_contact_intervals = disputed_contact_intervals(scheme_contact_review)
+        return {
+            "scheme_id": scheme.scheme_id,
+            "label": scheme.label,
+            "status": scheme.status,
+            "crossing_start_frame": scheme.crossing_start_frame,
+            "crossing_end_frame": scheme.crossing_end_frame,
+            "candidate_ids": list(scheme.candidate_ids),
+            "disputed_pose_intervals": unresolved_pose_intervals(
+                identity_statuses,
+                scheme.crossing_start_frame,
+                scheme.crossing_end_frame,
+            ),
+            "disputed_contact_intervals": [
+                interval
+                for interval in scheme_contact_intervals["contact_conflict_intervals"]
+                if interval["end_frame"] >= scheme.crossing_start_frame
+                and interval["start_frame"] <= scheme.crossing_end_frame
+            ],
+            "unobserved_contact_intervals": [
+                interval
+                for interval in scheme_contact_intervals["unobserved_contact_intervals"]
+                if interval["end_frame"] >= scheme.crossing_start_frame
+                and interval["start_frame"] <= scheme.crossing_end_frame
+            ],
+            "claim_conflict_intervals": scheme_contact_intervals[
+                "identity_claim_conflict_intervals"
+            ],
+            "contact_review": scheme_contact_review,
+            "needs_recheck": scheme.scheme_id in set(dependent_scheme_ids),
+        }
+
+    scheme_reviews = [_scheme_review(scheme) for scheme in identity_schemes]
+    contact_parameters = {
+        "contact_review": contact_review,
+        "object_missing_intervals": object_missing_intervals(contact_objects),
+        "disputed_contact_intervals": contact_intervals,
+        "contact_dependent_candidates": dependent_candidate_ids,
+        "contact_dependent_schemes": dependent_scheme_ids,
+        "scheme_reviews": scheme_reviews,
+    }
+
+    contact_ranges = [
+        (contact.start_frame, contact.end_frame) for contact in active_contacts
+    ] + [
+        (scheme.crossing_start_frame, scheme.crossing_end_frame)
+        for scheme in identity_schemes
+    ]
+    if contact_ranges:
+        contact_window = (
+            max(0, min(start for start, _end in contact_ranges) - 2),
+            min(
+                len(observations) - 1,
+                max(end for _start, end in contact_ranges) + 2,
+            ),
+        )
+    else:
+        contact_window = None
     review_window = _review_window(decisions, revisions, reassignments, len(observations))
+    if review_window is None:
+        review_window = contact_window
+    elif contact_window is not None:
+        review_window = (
+            min(review_window[0], contact_window[0]),
+            max(review_window[1], contact_window[1]),
+        )
     if based_on is not None and review_window is not None:
         start, end = review_window
         frames = [dict(frame) for frame in based_on.frames]
@@ -622,6 +744,7 @@ def reconstruct(
                 calibration,
             ),
             **decision_parameters,
+            **contact_parameters,
         }
         version = _next_version(based_on.version)
     else:
@@ -634,6 +757,7 @@ def reconstruct(
             "restored_ambiguities": [],
             "pose_comparison": [],
             **decision_parameters,
+            **contact_parameters,
         }
         version = "v001"
 
@@ -649,6 +773,8 @@ def reconstruct(
         revisions=revisions,
         decisions=decisions,
         reassignments=reassignments,
+        contact_observations=contact_observations,
+        identity_schemes=identity_schemes,
         identity_statuses=identity_statuses,
         based_on=based_on.version if based_on else None,
     )

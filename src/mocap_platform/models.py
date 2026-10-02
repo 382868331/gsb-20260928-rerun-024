@@ -154,6 +154,128 @@ IdentityStatus = Literal["certain", "confirmed", "ambiguous"]
 
 
 @dataclass
+class ObjectTrack:
+    """Observed trajectory of a contactable object; missing frames stay null."""
+
+    object_id: str
+    positions: list[Point3]
+    source: str = "manual"
+    notes: str = ""
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "object_track",
+            "version": 1,
+            "object_id": self.object_id,
+            "positions": self.positions,
+            "source": self.source,
+            "notes": self.notes,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class ContactObservation:
+    """Sourced manual statement that a person's body part touched an object.
+
+    Contact is evidence only: it never confirms an identity by itself and a
+    later automatic recommendation must never overwrite a manual statement.
+    """
+
+    contact_id: str
+    person_id: str
+    body_part: str
+    object_id: str
+    start_frame: int
+    end_frame: int
+    source: str
+    reason: str = ""
+    simultaneous_with: list[str] = field(default_factory=list)
+    status: Literal["active", "revoked"] = "active"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contact_id": self.contact_id,
+            "person_id": self.person_id,
+            "body_part": self.body_part,
+            "object_id": self.object_id,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "source": self.source,
+            "reason": self.reason,
+            "simultaneous_with": self.simultaneous_with,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class IdentityCandidate:
+    """One identity interpretation of a body trajectory inside a crossing.
+
+    ``joint_mapping`` maps candidate-person joint names to the observed marker
+    (person-qualified) actually carrying that joint under this interpretation.
+    Two candidates may map different identities, but the same observed marker
+    can never be claimed by two identities on the same frame.
+    """
+
+    candidate_id: str
+    person_id: str
+    joint_mapping: dict[str, str]
+    start_frame: int
+    end_frame: int
+    reason: str = ""
+    decision: Literal["adopted", "excluded", "open"] = "open"
+    decision_reason: str = ""
+    depends_on: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "person_id": self.person_id,
+            "joint_mapping": self.joint_mapping,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "reason": self.reason,
+            "decision": self.decision,
+            "decision_reason": self.decision_reason,
+            "depends_on": self.depends_on,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class IdentityScheme:
+    """Independent saved interpretation of the same crossing event."""
+
+    scheme_id: str
+    label: str
+    crossing_start_frame: int
+    crossing_end_frame: int
+    candidate_ids: list[str] = field(default_factory=list)
+    adopted_reassignment_ids: list[str] = field(default_factory=list)
+    notes: str = ""
+    status: Literal["open", "resolved", "superseded"] = "open"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scheme_id": self.scheme_id,
+            "label": self.label,
+            "crossing_start_frame": self.crossing_start_frame,
+            "crossing_end_frame": self.crossing_end_frame,
+            "candidate_ids": self.candidate_ids,
+            "adopted_reassignment_ids": self.adopted_reassignment_ids,
+            "notes": self.notes,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
 class ProcessingVersion:
     action_name: str
     pipeline_name: str
@@ -166,6 +288,8 @@ class ProcessingVersion:
     revisions: list[IdentityRevision] = field(default_factory=list)
     decisions: list[IdentityDecision] = field(default_factory=list)
     reassignments: list["TrajectoryReassignment"] = field(default_factory=list)
+    contact_observations: list["ContactObservation"] = field(default_factory=list)
+    identity_schemes: list["IdentityScheme"] = field(default_factory=list)
     identity_statuses: list[dict[str, IdentityStatus]] = field(default_factory=list)
     based_on: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -186,6 +310,10 @@ class ProcessingVersion:
             "trajectory_reassignments": [
                 reassignment.to_dict() for reassignment in self.reassignments
             ],
+            "contact_observations": [
+                contact.to_dict() for contact in self.contact_observations
+            ],
+            "identity_schemes": [scheme.to_dict() for scheme in self.identity_schemes],
             "frames": self.frames,
             "statuses": self.statuses,
             "identity_statuses": self.identity_statuses,
