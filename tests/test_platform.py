@@ -8,8 +8,11 @@ from pathlib import Path
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
 from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
-from mocap_platform.contact import candidates_dependent_on
-from mocap_platform.models import IdentityCandidate
+from mocap_platform.contact import (
+    candidates_dependent_on,
+    evaluate_contact_compatibility,
+)
+from mocap_platform.models import ContactObservation, IdentityCandidate
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -705,6 +708,157 @@ class PlatformIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 export["object_tracks"]["ball_01"]["positions"][27], None
             )
+
+    def test_contact_annotation_beyond_capture_length_stays_missing(self) -> None:
+        # Five observed frames (0-4); annotations reach frame 7. Frames past
+        # the capture length must remain missing evidence, never truncated and
+        # never treated as separation.
+        raw_observations = [
+            {
+                "p0_l_wrist": [0.0, 0.0, 0.0],
+                "p1_r_wrist": [0.0, 0.0, 0.0],
+            }
+            for _ in range(4)
+        ]
+        # The p1 hand track is shorter than the capture: frame 4 lacks it.
+        raw_observations.append({"p0_l_wrist": [0.0, 0.0, 0.0], "p1_r_wrist": None})
+        # Both object tracks are shorter than the capture: only 3 frames long.
+        objects = {
+            "ball": [[0.0, 0.0, 0.0] for _ in range(3)],
+            "box": [[0.0, 0.0, 0.0] for _ in range(3)],
+        }
+
+        single = ContactObservation(
+            contact_id="contact_single_beyond_capture",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="box",
+            start_frame=1,
+            end_frame=7,
+            source="manual_review",
+            reason="annotated past the end of the capture",
+        )
+        grasp_p0 = ContactObservation(
+            contact_id="contact_grasp_p0",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="ball",
+            start_frame=2,
+            end_frame=7,
+            source="manual_review",
+            reason="two-person grasp reaching past the capture length",
+            simultaneous_with=["contact_grasp_p1"],
+        )
+        grasp_p1 = ContactObservation(
+            contact_id="contact_grasp_p1",
+            person_id="p1",
+            body_part="r_wrist",
+            object_id="ball",
+            start_frame=2,
+            end_frame=7,
+            source="manual_review",
+            reason="second hand on the same object past the capture length",
+            simultaneous_with=["contact_grasp_p0"],
+        )
+        review = evaluate_contact_compatibility(
+            [single, grasp_p0, grasp_p1], [], raw_observations, objects
+        )
+        results = {
+            item["contact_id"]: item for item in review["contact_results"]
+        }
+
+        # Single-person contact: annotated range kept, tail frames missing.
+        single_result = results["contact_single_beyond_capture"]
+        self.assertEqual(
+            (single_result["start_frame"], single_result["end_frame"]), (1, 7)
+        )
+        self.assertEqual(single_result["supported_frames"], [1, 2])
+        self.assertEqual(single_result["missing_observation_frames"], [3, 4, 5, 6, 7])
+        self.assertEqual(
+            single_result["missing_intervals"], [{"start_frame": 3, "end_frame": 7}]
+        )
+        # Missing frames are not treated as separation: support still stands.
+        self.assertEqual(single_result["verdict"], "still_plausible")
+        # Only raw observed positions are used; nothing is interpolated.
+        self.assertEqual(
+            [item["frame"] for item in single_result["observations_used"]], [1, 2]
+        )
+
+        # Two-person grasp: the simultaneous check must not run past the
+        # capture length, and per-contact results keep the missing tail.
+        grasp_p0_result = results["contact_grasp_p0"]
+        self.assertEqual(
+            (grasp_p0_result["start_frame"], grasp_p0_result["end_frame"]), (2, 7)
+        )
+        self.assertEqual(grasp_p0_result["supported_frames"], [2])
+        self.assertEqual(
+            grasp_p0_result["missing_observation_frames"], [3, 4, 5, 6, 7]
+        )
+        grasp_p1_result = results["contact_grasp_p1"]
+        self.assertEqual(grasp_p1_result["supported_frames"], [2])
+        # Frame 4 misses the p1 hand track; frames 3 and 5-7 miss more.
+        self.assertEqual(
+            grasp_p1_result["missing_observation_frames"], [3, 4, 5, 6, 7]
+        )
+        self.assertEqual(
+            review["simultaneous_contacts"],
+            [
+                {
+                    "frame": 2,
+                    "object_id": "ball",
+                    "contacts": ["contact_grasp_p0", "contact_grasp_p1"],
+                    "markers": ["p0_l_wrist", "p1_r_wrist"],
+                }
+            ],
+        )
+
+        # Save/reload keeps every manual decision; revoking one contact leaves
+        # the others active, and the raw capture stays untouched.
+        with tempfile.TemporaryDirectory() as directory:
+            store = PlatformStore(directory)
+            action = "demo_action"
+            pipeline = "contact_beyond_capture"
+            for contact in (single, grasp_p0, grasp_p1):
+                store.save_contact(action, pipeline, contact)
+            store.revoke_contact(
+                action,
+                pipeline,
+                grasp_p1.contact_id,
+                reason="withdrawn for recutting",
+            )
+            reloaded = {
+                item["contact_id"]: item["status"]
+                for item in store.load_contacts(action, pipeline)
+            }
+            self.assertEqual(
+                reloaded,
+                {
+                    "contact_single_beyond_capture": "active",
+                    "contact_grasp_p0": "active",
+                    "contact_grasp_p1": "revoked",
+                },
+            )
+            active_contacts = [
+                ContactObservation(**item)
+                for item in store.load_contacts(action, pipeline)
+            ]
+            recheck = evaluate_contact_compatibility(
+                active_contacts, [], raw_observations, objects
+            )
+            recheck_ids = {
+                item["contact_id"] for item in recheck["contact_results"]
+            }
+            self.assertEqual(
+                recheck_ids,
+                {"contact_single_beyond_capture", "contact_grasp_p0"},
+            )
+            recheck_single = recheck["contact_results"][0]
+            self.assertEqual(
+                recheck_single["missing_observation_frames"], [3, 4, 5, 6, 7]
+            )
+            # Raw observations were never overwritten by interpolated values.
+            self.assertIsNone(raw_observations[4]["p1_r_wrist"])
+            self.assertEqual(len(raw_observations), 5)
 
 
 if __name__ == "__main__":
