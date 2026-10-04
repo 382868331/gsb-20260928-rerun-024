@@ -91,9 +91,16 @@ def evaluate_contact_compatibility(
         missing: list[int] = []
         observations_used: list[dict[str, Any]] = []
         start = max(0, contact.start_frame)
-        end = min(len(raw_observations) - 1, contact.end_frame)
+        # Keep the annotated range intact: frames past the capture length are
+        # missing evidence, not a reason to truncate the annotation.
+        end = contact.end_frame
         for frame_index in range(start, end + 1):
-            body = raw_observations[frame_index].get(body_marker)
+            frame_observations = (
+                raw_observations[frame_index]
+                if frame_index < len(raw_observations)
+                else {}
+            )
+            body = frame_observations.get(body_marker)
             obj = (
                 object_track[frame_index]
                 if frame_index < len(object_track)
@@ -163,8 +170,13 @@ def evaluate_contact_compatibility(
             for frame_index in range(start, end + 1):
                 obj = objects.get(first.object_id, [])
                 obj_point = obj[frame_index] if frame_index < len(obj) else None
-                first_point = raw_observations[frame_index].get(first_marker)
-                second_point = raw_observations[frame_index].get(second_marker)
+                frame_observations = (
+                    raw_observations[frame_index]
+                    if frame_index < len(raw_observations)
+                    else {}
+                )
+                first_point = frame_observations.get(first_marker)
+                second_point = frame_observations.get(second_marker)
                 if obj_point is None or first_point is None or second_point is None:
                     continue
                 if (

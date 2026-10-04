@@ -8,8 +8,12 @@ from pathlib import Path
 from mocap_platform.cli import demo
 from mocap_platform.evaluation import evaluate
 from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevision
-from mocap_platform.contact import candidates_dependent_on
+from mocap_platform.contact import (
+    candidates_dependent_on,
+    evaluate_contact_compatibility,
+)
 from mocap_platform.models import IdentityCandidate
+from mocap_platform.models import ContactObservation
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -705,6 +709,143 @@ class PlatformIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 export["object_tracks"]["ball_01"]["positions"][27], None
             )
+
+
+class ContactBeyondCaptureLengthTest(unittest.TestCase):
+    def _observations(self, frames: list[dict[str, list[float]]]) -> list[dict]:
+        return frames
+
+    def test_single_contact_annotated_beyond_capture_length(self) -> None:
+        # Five frames of observations, contact annotated through frame 7.
+        observations = self._observations(
+            [{"p0_l_wrist": [0.0, 0.0, 0.0]} for _ in range(5)]
+        )
+        objects = {"ball": [[0.0, 0.0, 0.0] for _ in range(5)]}
+        contact = ContactObservation(
+            contact_id="contact_long",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="ball",
+            start_frame=3,
+            end_frame=7,
+            source="manual_review",
+        )
+        review = evaluate_contact_compatibility([contact], [], observations, objects)
+        result = review["contact_results"][0]
+        # The annotated range is kept, not truncated to the capture length.
+        self.assertEqual(result["start_frame"], 3)
+        self.assertEqual(result["end_frame"], 7)
+        # Observed frames still support; over-tail frames are missing evidence.
+        self.assertEqual(result["supported_frames"], [3, 4])
+        self.assertEqual(result["missing_observation_frames"], [5, 6, 7])
+        self.assertEqual(
+            result["missing_intervals"], [{"start_frame": 5, "end_frame": 7}]
+        )
+        # Missing frames are not treated as separation/contradiction.
+        self.assertEqual(result["incompatible_frames"], [])
+        self.assertEqual(result["verdict"], "still_plausible")
+
+    def test_simultaneous_contact_beyond_capture_length_does_not_crash(self) -> None:
+        observations = self._observations(
+            [
+                {
+                    "p0_l_wrist": [0.0, 0.0, 0.0],
+                    "p1_r_wrist": [0.05, 0.0, 0.0],
+                }
+                for _ in range(5)
+            ]
+        )
+        objects = {"ball": [[0.0, 0.0, 0.0] for _ in range(5)]}
+        first = ContactObservation(
+            contact_id="contact_p0",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="ball",
+            start_frame=2,
+            end_frame=8,
+            source="manual_review",
+        )
+        second = ContactObservation(
+            contact_id="contact_p1",
+            person_id="p1",
+            body_part="r_wrist",
+            object_id="ball",
+            start_frame=4,
+            end_frame=9,
+            source="manual_review",
+        )
+        review = evaluate_contact_compatibility(
+            [first, second], [], observations, objects
+        )
+        # Existing simultaneous support within the capture is still returned.
+        self.assertEqual(
+            [item["frame"] for item in review["simultaneous_contacts"]],
+            [4],
+        )
+        results = {
+            item["contact_id"]: item for item in review["contact_results"]
+        }
+        self.assertEqual(results["contact_p0"]["end_frame"], 8)
+        self.assertEqual(
+            results["contact_p0"]["missing_observation_frames"], [5, 6, 7, 8]
+        )
+        self.assertEqual(results["contact_p1"]["end_frame"], 9)
+        self.assertEqual(
+            results["contact_p1"]["missing_observation_frames"], [5, 6, 7, 8, 9]
+        )
+        self.assertEqual(results["contact_p1"]["supported_frames"], [4])
+
+    def test_shorter_object_track_and_shorter_hand_track(self) -> None:
+        # Object track shorter than the capture; hand track shorter than that.
+        observations = self._observations(
+            [{"p0_l_wrist": [0.0, 0.0, 0.0]}] * 3 + [{}] * 2
+        )
+        objects = {"ball": [[0.0, 0.0, 0.0]] * 4}
+        contact = ContactObservation(
+            contact_id="contact_short_tracks",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="ball",
+            start_frame=0,
+            end_frame=7,
+            source="manual_review",
+        )
+        review = evaluate_contact_compatibility([contact], [], observations, objects)
+        result = review["contact_results"][0]
+        self.assertEqual(result["end_frame"], 7)
+        self.assertEqual(result["supported_frames"], [0, 1, 2])
+        self.assertEqual(
+            result["missing_observation_frames"], [3, 4, 5, 6, 7]
+        )
+        self.assertEqual(
+            result["missing_intervals"], [{"start_frame": 3, "end_frame": 7}]
+        )
+        self.assertEqual(result["verdict"], "still_plausible")
+
+    def test_contradictions_before_capture_end_are_preserved(self) -> None:
+        observations = self._observations(
+            [{"p0_l_wrist": [0.0, 0.0, 0.0]}]
+            + [{"p0_l_wrist": [5.0, 5.0, 5.0]}]
+            + [{"p0_l_wrist": [0.0, 0.0, 0.0]}] * 3
+        )
+        objects = {"ball": [[0.0, 0.0, 0.0]] * 5}
+        contact = ContactObservation(
+            contact_id="contact_mixed",
+            person_id="p0",
+            body_part="l_wrist",
+            object_id="ball",
+            start_frame=0,
+            end_frame=7,
+            source="manual_review",
+        )
+        review = evaluate_contact_compatibility([contact], [], observations, objects)
+        result = review["contact_results"][0]
+        self.assertEqual(result["verdict"], "geometrically_incompatible")
+        self.assertEqual(result["supported_frames"], [0, 2, 3, 4])
+        self.assertEqual(
+            [item["frame"] for item in result["incompatible_frames"]], [1]
+        )
+        self.assertEqual(result["missing_observation_frames"], [5, 6, 7])
 
 
 if __name__ == "__main__":
