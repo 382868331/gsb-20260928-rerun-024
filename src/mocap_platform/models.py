@@ -276,6 +276,41 @@ class IdentityScheme:
 
 
 @dataclass
+class SupplementaryBatch:
+    """One batch of supplementary observations submitted for contact gaps.
+
+    ``tracks`` maps a target name ("object" for the object itself or a
+    person-qualified marker such as "p0_l_wrist") to
+    {"start_frame": int, "positions": [Point3, ...]}.  Tracks in one batch
+    may have different lengths and only partially overlap.  Batches are saved
+    as ``pending``; reviewers explicitly adopt chosen missing intervals, and
+    adoption/withdrawal are appended as separate records so the batch itself
+    is never rewritten.
+    """
+
+    batch_id: str
+    object_id: str
+    tracks: dict[str, dict[str, Any]]
+    source: str
+    reason: str = ""
+    adopted_intervals: list[dict[str, int]] = field(default_factory=list)
+    status: Literal["pending", "partially_adopted", "adopted", "withdrawn"] = "pending"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "object_id": self.object_id,
+            "tracks": self.tracks,
+            "source": self.source,
+            "reason": self.reason,
+            "adopted_intervals": self.adopted_intervals,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
 class ProcessingVersion:
     action_name: str
     pipeline_name: str

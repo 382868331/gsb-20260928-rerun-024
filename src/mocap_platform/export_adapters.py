@@ -17,6 +17,7 @@ def build_review_export(
     candidates: list[Any] | None = None,
     schemes: list[Any] | None = None,
     object_tracks: dict[str, Any] | None = None,
+    supplements: list[Any] | None = None,
 ) -> dict[str, Any]:
     impacts = {
         item["decision_id"]: item["status"]
@@ -32,6 +33,11 @@ def build_review_export(
         for item in contact_review.get("contact_results", [])
     }
     candidate_review = contact_review.get("claim_conflicts", [])
+    supplement_review = processing.get("parameters", {}).get("supplement_review", {})
+    supplement_results = {
+        item["batch_id"]: item
+        for item in supplement_review.get("batch_results", [])
+    }
     conflicting_candidates = {
         candidate_id
         for item in candidate_review
@@ -82,6 +88,34 @@ def build_review_export(
             }
             for decision in decisions
         ],
+        "supplementary_batches": [
+            {
+                "batch_id": batch.batch_id,
+                "object_id": batch.object_id,
+                "source": batch.source,
+                "status": batch.status,
+                "reason": batch.reason,
+                "adopted_intervals": batch.adopted_intervals,
+                "tracks": {
+                    target: {
+                        "start_frame": track["start_frame"],
+                        "positions": track["positions"],
+                    }
+                    for target, track in batch.tracks.items()
+                },
+                "frame_evidence": supplement_results.get(batch.batch_id, {}).get(
+                    "observations_used", []
+                ),
+                "contact_results": supplement_results.get(batch.batch_id, {}).get(
+                    "contacts", []
+                ),
+            }
+            for batch in (supplements or [])
+        ],
+        "supplement_conflicts": supplement_review.get("conflicting_supplements", []),
+        "supplement_duplicate_adoptions": supplement_review.get(
+            "duplicate_adoptions", []
+        ),
         "object_tracks": object_tracks or {},
         "manual_contact_notes": [
             {

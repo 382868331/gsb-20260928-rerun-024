@@ -669,7 +669,7 @@ class PlatformIntegrationTest(unittest.TestCase):
                 ],
                 "active",
             )
-            self.assertEqual(len(store.load_schemes(action, pipeline)), 3)
+            self.assertEqual(len(store.load_schemes(action, pipeline)), 4)
             self.assertIn("ball_01", store.load_object_tracks(action, pipeline))
 
             export = json.loads(
@@ -704,7 +704,7 @@ class PlatformIntegrationTest(unittest.TestCase):
                     "decision_reason"
                 ],
             )
-            self.assertEqual(len(export["identity_schemes"]), 3)
+            self.assertEqual(len(export["identity_schemes"]), 4)
             self.assertEqual(
                 export["object_tracks"]["ball_01"]["positions"][27], None
             )
@@ -860,6 +860,163 @@ class PlatformIntegrationTest(unittest.TestCase):
             self.assertIsNone(raw_observations[4]["p1_r_wrist"])
             self.assertEqual(len(raw_observations), 5)
 
+    def test_supplementary_batches_partial_adoption_withdrawal_and_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            demo(directory)
+            store = PlatformStore(directory)
+            action = "demo_multi_person_action"
+            pipeline = "contact_evidence_review"
+            base = Path(directory, "processing", action, pipeline)
+
+            def load(version: str) -> dict:
+                return json.loads(
+                    base.joinpath("versions", version, "reconstruction.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            v4 = load("v004")["parameters"]["supplement_review"]
+            v5 = load("v005")["parameters"]
+            v6 = load("v006")["parameters"]
+
+            # Pending batches leave every missing frame untouched.
+            pending = {item["batch_id"]: item for item in v4["batch_results"]}
+            primary_pending = pending["supplement_001_two_hand_remeasure"]
+            self.assertEqual(primary_pending["status"], "pending")
+            self.assertEqual(primary_pending["pending_frames"], [22, 23])
+            self.assertEqual(primary_pending["still_missing_frames"], [27])
+            self.assertEqual(primary_pending["supported_frames"], [])
+
+            # Partial adoption: supporting, contradicting and still-missing
+            # ranges are listed side by side per batch.
+            review = v5["supplement_review"]
+            batches = {item["batch_id"]: item for item in review["batch_results"]}
+            primary = batches["supplement_001_two_hand_remeasure"]
+            conflicting = batches["supplement_002_conflicting_remeasure"]
+            self.assertEqual(primary["status"], "partially_adopted")
+            self.assertEqual(primary["supported_frames"], [22, 23])
+            self.assertEqual(conflicting["contradicting_frames"], [22, 23])
+            self.assertEqual(primary["still_missing_frames"], [27])
+            self.assertEqual(
+                review["still_missing_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+
+            # The confirmed manual contact decision is protected: the
+            # supplementary batch cannot rewrite it.
+            protected = primary["contacts"][0]
+            self.assertEqual(
+                protected["contact_id"],
+                "contact_001_p0_left_hand_ball_during_crossing",
+            )
+            self.assertTrue(protected["protected_by_confirmed_decision"])
+            contact_results = {
+                item["contact_id"]: item
+                for item in v5["contact_review"]["contact_results"]
+            }
+            self.assertEqual(
+                contact_results["contact_001_p0_left_hand_ball_during_crossing"][
+                    "verdict"
+                ],
+                "still_plausible",
+            )
+
+            # Repeated adoption of the same frames adds no extra evidence and
+            # disagreeing batches are shown side by side.
+            self.assertEqual(
+                len(review["duplicate_adoptions"]), 2
+            )
+            self.assertTrue(
+                all(
+                    item["note"].startswith("frame evidence counted once")
+                    for item in review["duplicate_adoptions"]
+                )
+            )
+            conflicts = review["conflicting_supplements"]
+            self.assertEqual([item["frame"] for item in conflicts], [22, 23])
+            verdicts = {
+                (claim["batch_id"], claim["verdict"])
+                for item in conflicts
+                for claim in item["claims"]
+            }
+            self.assertIn(("supplement_001_two_hand_remeasure", "supported"), verdicts)
+            self.assertIn(
+                ("supplement_002_conflicting_remeasure", "contradicting"), verdicts
+            )
+
+            # Withdrawing one batch rechecks only dependent interpretations.
+            self.assertEqual(
+                v6["supplement_dependent_candidates"],
+                ["candidate_supplement_assisted_p1_right_hand"],
+            )
+            self.assertEqual(
+                v6["supplement_dependent_schemes"],
+                ["scheme_004_supplement_assisted"],
+            )
+            self.assertEqual(
+                v6["contact_dependent_candidates"],
+                ["candidate_no_swap_keep_observed_labels"],
+            )
+            withdrawn = {
+                item["batch_id"]: item
+                for item in v6["supplement_review"]["batch_results"]
+            }
+            self.assertEqual(
+                withdrawn["supplement_002_conflicting_remeasure"]["status"],
+                "withdrawn",
+            )
+            self.assertEqual(
+                withdrawn["supplement_002_conflicting_remeasure"]["supported_frames"],
+                [],
+            )
+            self.assertEqual(
+                withdrawn["supplement_001_two_hand_remeasure"]["supported_frames"],
+                [22, 23],
+            )
+
+            # Reopened persistence and per-frame export traceability.
+            stored = {
+                item["batch_id"]: item
+                for item in store.load_supplements(action, pipeline)
+            }
+            self.assertEqual(
+                stored["supplement_001_two_hand_remeasure"]["status"],
+                "partially_adopted",
+            )
+            self.assertEqual(
+                stored["supplement_001_two_hand_remeasure"]["adopted_intervals"],
+                [{"start_frame": 22, "end_frame": 23}],
+            )
+            self.assertEqual(
+                stored["supplement_002_conflicting_remeasure"]["status"], "withdrawn"
+            )
+
+            export = json.loads(
+                base.joinpath("review_export.json").read_text(encoding="utf-8")
+            )
+            exported = {
+                item["batch_id"]: item for item in export["supplementary_batches"]
+            }
+            primary_export = exported["supplement_001_two_hand_remeasure"]
+            self.assertEqual(primary_export["status"], "partially_adopted")
+            self.assertEqual(
+                primary_export["adopted_intervals"],
+                [{"start_frame": 22, "end_frame": 23}],
+            )
+            self.assertIn("p0_l_wrist", primary_export["tracks"])
+            evidence_frames = {
+                (item["frame"], item["batch_id"], item["body_target"])
+                for item in primary_export["frame_evidence"]
+            }
+            self.assertEqual(
+                evidence_frames,
+                {
+                    (22, "supplement_001_two_hand_remeasure", "p1_r_wrist"),
+                    (23, "supplement_001_two_hand_remeasure", "p1_r_wrist"),
+                },
+            )
+            self.assertEqual(len(export["supplement_conflicts"]), 2)
+            self.assertEqual(len(export["supplement_duplicate_adoptions"]), 2)
 
 if __name__ == "__main__":
     unittest.main()

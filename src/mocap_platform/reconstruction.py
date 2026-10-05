@@ -8,6 +8,7 @@ from .contact import (
     candidates_dependent_on,
     disputed_contact_intervals,
     evaluate_contact_compatibility,
+    evaluate_supplementary_batches,
     object_missing_intervals,
     schemes_dependent_on,
     unresolved_pose_intervals,
@@ -552,6 +553,7 @@ def reconstruct(
     identity_candidates: list[Any] | None = None,
     contact_objects: dict[str, list[list[float] | None]] | None = None,
     identity_schemes: list[Any] | None = None,
+    supplementary_batches: list[Any] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
@@ -561,6 +563,7 @@ def reconstruct(
     identity_candidates = identity_candidates or []
     contact_objects = contact_objects or {}
     identity_schemes = identity_schemes or []
+    supplementary_batches = supplementary_batches or []
     applied_reassignments, reassignment_disputes, disputed_ids = resolve_reassignments(
         reassignments
     )
@@ -613,6 +616,18 @@ def reconstruct(
         active_contacts, identity_candidates, observations, contact_objects
     )
     contact_intervals = disputed_contact_intervals(contact_review)
+    supplement_review = evaluate_supplementary_batches(
+        supplementary_batches,
+        active_contacts,
+        identity_candidates,
+        observations,
+        contact_objects,
+    )
+    withdrawn_supplement_ids = {
+        batch.batch_id
+        for batch in supplementary_batches
+        if getattr(batch, "status", "pending") == "withdrawn"
+    }
     dependent_candidate_ids = candidates_dependent_on(
         identity_candidates,
         revoked_contact_ids,
@@ -676,8 +691,22 @@ def reconstruct(
         "contact_review": contact_review,
         "object_missing_intervals": object_missing_intervals(contact_objects),
         "disputed_contact_intervals": contact_intervals,
+        "supplement_review": supplement_review,
         "contact_dependent_candidates": dependent_candidate_ids,
         "contact_dependent_schemes": dependent_scheme_ids,
+        "supplement_dependent_candidates": [
+            candidate.candidate_id
+            for candidate in identity_candidates
+            if set(candidate.depends_on) & withdrawn_supplement_ids
+        ],
+        "supplement_dependent_schemes": schemes_dependent_on(
+            identity_schemes,
+            {
+                candidate.candidate_id
+                for candidate in identity_candidates
+                if set(candidate.depends_on) & withdrawn_supplement_ids
+            },
+        ),
         "scheme_reviews": scheme_reviews,
     }
 

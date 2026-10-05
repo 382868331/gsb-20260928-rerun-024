@@ -15,6 +15,7 @@ from .models import (
     IdentityScheme,
     ObjectTrack,
     ProcessingVersion,
+    SupplementaryBatch,
     TrajectoryReassignment,
     utc_now,
 )
@@ -257,6 +258,104 @@ class PlatformStore:
         path = self.processing_dir(action_name, pipeline_name) / "review_export.json"
         atomic_write_json(path, export)
         return path
+
+    def supplements_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "supplements"
+
+    def save_supplement(
+        self, action_name: str, pipeline_name: str, batch: SupplementaryBatch
+    ) -> Path:
+        path = self.supplements_dir(action_name, pipeline_name) / f"{batch.batch_id}.json"
+        if path.exists():
+            raise FileExistsError(f"supplementary batch is immutable and already exists: {path}")
+        atomic_write_json(path, batch.to_dict())
+        return path
+
+    def adopt_supplement(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        batch_id: str,
+        intervals: list[dict[str, int]],
+        reason: str = "",
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        base_path = directory / f"{batch_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot adopt unknown supplement: {base_path}")
+        existing = sorted(directory.glob(f"{batch_id}.adoption.*.json"))
+        path = directory / f"{batch_id}.adoption.{len(existing) + 1:03d}.json"
+        atomic_write_json(
+            path,
+            {
+                "kind": "supplement_adoption",
+                "batch_id": batch_id,
+                "intervals": intervals,
+                "reason": reason,
+                "adopted_at": utc_now(),
+            },
+        )
+        return path
+
+    def withdraw_supplement(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        batch_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        base_path = directory / f"{batch_id}.json"
+        if not base_path.exists():
+            raise FileNotFoundError(f"cannot withdraw unknown supplement: {base_path}")
+        path = directory / f"{batch_id}.withdrawal.json"
+        if path.exists():
+            raise FileExistsError(f"supplement already withdrawn: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "supplement_withdrawal",
+                "batch_id": batch_id,
+                "reason": reason,
+                "withdrawn_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_supplements(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        withdrawn = {
+            path.name[: -len(".withdrawal.json")]
+            for path in directory.glob("*.withdrawal.json")
+        }
+        adoptions: dict[str, list[dict[str, Any]]] = {}
+        for path in sorted(directory.glob("*.adoption.*.json")):
+            record = read_json(path)
+            adoptions.setdefault(record["batch_id"], []).append(record)
+        batches: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if ".adoption." in path.name or path.name.endswith(".withdrawal.json"):
+                continue
+            data = read_json(path)
+            batch_id = data["batch_id"]
+            intervals = [
+                interval
+                for record in adoptions.get(batch_id, [])
+                for interval in record["intervals"]
+            ]
+            data["adopted_intervals"] = intervals
+            if batch_id in withdrawn:
+                data["status"] = "withdrawn"
+            elif intervals:
+                data["status"] = "partially_adopted"
+            else:
+                data["status"] = "pending"
+            batches.append(data)
+        return batches
 
     def objects_dir(self, action_name: str, pipeline_name: str) -> Path:
         return self.processing_dir(action_name, pipeline_name) / "objects"

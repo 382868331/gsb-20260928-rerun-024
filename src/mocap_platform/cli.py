@@ -15,6 +15,7 @@ from .models import (
     CaptureRecord,
     IdentityDecision,
     IdentityRevision,
+    SupplementaryBatch,
     TrajectoryReassignment,
 )
 from .synthetic_multi import (
@@ -863,6 +864,206 @@ def demo(output: str) -> None:
     }
     print(f"contact evidence review schemes={scheme_verdicts}")
 
+    # Supplementary observation batches: two people touch the same ball, and
+    # reviewers remeasure the object and both hands with tracks of different
+    # lengths that only partially overlap.  Batches are saved as pending
+    # evidence; nothing is adopted yet and old versions keep their gaps.
+    def true_ball_position(frame_index: int) -> list[float]:
+        point = scoped_truth[frame_index]["p0_l_wrist"]
+        if 20 <= frame_index <= 24:
+            other = scoped_truth[frame_index]["p1_r_wrist"]
+            return [(point[axis] + other[axis]) / 2 for axis in range(3)]
+        return list(point)
+
+    def offset(point: list[float], amount: float) -> list[float]:
+        return [point[0] + amount, point[1], point[2]]
+
+    supplement_primary = SupplementaryBatch(
+        batch_id="supplement_001_two_hand_remeasure",
+        object_id="ball_01",
+        tracks={
+            "object": {
+                "start_frame": 22,
+                "positions": [true_ball_position(index) for index in range(22, 29)],
+            },
+            "p1_r_wrist": {
+                "start_frame": 21,
+                "positions": [
+                    offset(true_ball_position(index), 0.05)
+                    for index in range(21, 27)
+                ],
+            },
+            "p0_l_wrist": {
+                "start_frame": 25,
+                "positions": [
+                    list(scoped_truth[index]["p0_l_wrist"])
+                    for index in range(25, 30)
+                ],
+            },
+        },
+        source="manual_remeasure_session_a",
+        reason="remeasured the ball and both hands during the grasp gap",
+    )
+    supplement_conflicting = SupplementaryBatch(
+        batch_id="supplement_002_conflicting_remeasure",
+        object_id="ball_01",
+        tracks={
+            "object": {
+                "start_frame": 22,
+                "positions": [
+                    offset(true_ball_position(index), 0.6)
+                    for index in range(22, 30)
+                ],
+            },
+            "p1_r_wrist": {
+                "start_frame": 22,
+                "positions": [
+                    offset(true_ball_position(index), 0.05)
+                    for index in range(22, 25)
+                ],
+            },
+        },
+        source="manual_remeasure_session_b",
+        reason="second remeasure session disagrees on the ball position",
+    )
+    for batch in (supplement_primary, supplement_conflicting):
+        store.save_supplement(action_name, contact_pipeline, batch)
+
+    supplement_candidate = IdentityCandidate(
+        candidate_id="candidate_supplement_assisted_p1_right_hand",
+        person_id="p1",
+        joint_mapping={"r_wrist": "p1_r_wrist"},
+        start_frame=22,
+        end_frame=23,
+        reason="interpretation proposed on the second remeasure session",
+        depends_on=["supplement_002_conflicting_remeasure"],
+    )
+    store.save_candidate(action_name, contact_pipeline, supplement_candidate)
+    scheme_supplement = IdentityScheme(
+        scheme_id="scheme_004_supplement_assisted",
+        label="p1 right hand interpretation backed by the remeasure batch",
+        crossing_start_frame=22,
+        crossing_end_frame=23,
+        candidate_ids=[supplement_candidate.candidate_id],
+        notes="Depends on a supplementary batch that is still under review.",
+        status="open",
+    )
+    store.save_scheme(action_name, contact_pipeline, scheme_supplement)
+
+    all_contact_candidates = [
+        IdentityCandidate(**data)
+        for data in store.load_candidates(action_name, contact_pipeline)
+    ]
+    all_contact_schemes = [scheme_swap, scheme_keep, scheme_conflict, scheme_supplement]
+    pending_batches = [
+        SupplementaryBatch(**data)
+        for data in store.load_supplements(action_name, contact_pipeline)
+    ]
+    contact_v4 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=all_contact_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=all_contact_schemes,
+        supplementary_batches=pending_batches,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v3,
+    )
+    store.save_processing(contact_v4)
+
+    # Reopened review: partially adopt only the missing intervals the
+    # reviewer trusts from each pending batch.
+    store.adopt_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_primary.batch_id,
+        intervals=[{"start_frame": 22, "end_frame": 23}],
+        reason="adopt the two-hand grasp remeasure for the occluded frames",
+    )
+    store.adopt_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_conflicting.batch_id,
+        intervals=[{"start_frame": 22, "end_frame": 23}],
+        reason="adopt the second session for side-by-side comparison",
+    )
+    adopted_batches = [
+        SupplementaryBatch(**data)
+        for data in store.load_supplements(action_name, contact_pipeline)
+    ]
+    contact_v5 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=all_contact_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=all_contact_schemes,
+        supplementary_batches=adopted_batches,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v4,
+    )
+    store.save_processing(contact_v5)
+
+    contact_export = build_review_export(
+        store.load_capture(contact_capture_id),
+        contact_v5.to_dict(),
+        [],
+        [],
+        contacts=reloaded_contacts,
+        candidates=all_contact_candidates,
+        schemes=all_contact_schemes,
+        object_tracks=store.load_object_tracks(action_name, contact_pipeline),
+        supplements=adopted_batches,
+    )
+    store.save_review_export(action_name, contact_pipeline, contact_export)
+
+    # Withdrawing one batch only rechecks the interpretations that depend
+    # on it; the adopted intervals of the other batch remain in place.
+    store.withdraw_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_conflicting.batch_id,
+        reason="second remeasure session retracted by its operator",
+    )
+    remaining_batches = [
+        SupplementaryBatch(**data)
+        for data in store.load_supplements(action_name, contact_pipeline)
+    ]
+    contact_v6 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=all_contact_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=all_contact_schemes,
+        supplementary_batches=remaining_batches,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v5,
+    )
+    store.save_processing(contact_v6)
+    contact_report["supplement_review"] = contact_v5.parameters["supplement_review"]
+    contact_report["supplement_dependent_candidates"] = contact_v6.parameters[
+        "supplement_dependent_candidates"
+    ]
+    contact_report["supplement_dependent_schemes"] = contact_v6.parameters[
+        "supplement_dependent_schemes"
+    ]
+    store.save_report(action_name, contact_pipeline, contact_report)
+    supplement_status = {
+        item["batch_id"]: item["status"]
+        for item in contact_v6.parameters["supplement_review"]["batch_results"]
+    }
+    print(f"supplement review statuses={supplement_status}")
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mocap-platform")
