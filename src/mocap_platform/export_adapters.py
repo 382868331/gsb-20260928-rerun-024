@@ -113,6 +113,10 @@ def build_review_export(
             for batch in (supplements or [])
         ],
         "supplement_conflicts": supplement_review.get("conflicting_supplements", []),
+        "supplement_source_conflicts": supplement_review.get("source_conflicts", []),
+        "supplement_combined_contact_results": supplement_review.get(
+            "combined_contact_results", []
+        ),
         "supplement_duplicate_adoptions": supplement_review.get(
             "duplicate_adoptions", []
         ),

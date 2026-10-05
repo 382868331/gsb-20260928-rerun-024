@@ -29,7 +29,8 @@
 已有接触缺失范围可以补交分批观测（`SupplementaryBatch`，保存在 `processing/<action>/<pipeline>/supplements/`）：同一物体可补交多批，每批为物体和两只手分别携带长短不同、部分重叠的轨迹。补测批写入后不可变，初始为 `pending`；用户用 `adopt_supplement` 按缺失区间逐段采用（可多次追加，状态变为 `partially_adopted`），用 `withdraw_supplement` 追加独立撤回记录。
 
 - 补测只作为复核证据：旧处理版本保留当时可见的观测与缺口，补测结果不回写 `contact_review` 的判定；已采纳候选对应的人工接触决定标记 `protected_by_confirmed_decision`，即使补测矛盾也不改写。
-- 冲突补测并列展示：`supplement_review` 逐批给出支持（`supported_frames`）、矛盾（`contradicting_frames`）、未采用（`pending_frames`）与仍缺失（`still_missing_frames`）范围；两批对同一帧结论相反时写入 `conflicting_supplements` 并列对照。
+- 逐帧事实合并：已采纳补测可以只补物体或只补一只手，并与该帧有效的原始观测或另一批已采纳补测组合；只有仍缺任一必需位置的帧保留在缺失范围。未采纳补测只列为待解释，撤回补测不参与事实合并。
+- 冲突补测并列展示：`supplement_review` 逐批给出支持（`supported_frames`）、矛盾（`contradicting_frames`）、未采用（`pending_frames`）与仍缺失（`still_missing_frames`）范围；两批对同一帧结论相反时写入 `conflicting_supplements`，同一必需位置的来源不一致时写入 `source_conflicts`，均并列对照且不按到达顺序覆盖。
 - 重复采用不增加证据：同一帧被多批采用时记入 `duplicate_adoptions`，证据只计一次。
 - 撤回一批补测只影响依赖它的解释：`supplement_dependent_candidates` 与 `supplement_dependent_schemes` 逐条列出需重检的候选与方案，其他批次已采用的区间保持不变。
 - 未决补测保存后可重开（`load_supplements`）再局部采用；导出的 `review_export.json` 中 `supplementary_batches[].frame_evidence` 逐帧记录使用了哪一批的哪条轨迹、距离与人工采用区间，可完整追溯。

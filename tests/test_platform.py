@@ -11,8 +11,9 @@ from mocap_platform.models import CaptureRecord, IdentityDecision, IdentityRevis
 from mocap_platform.contact import (
     candidates_dependent_on,
     evaluate_contact_compatibility,
+    evaluate_supplementary_batches,
 )
-from mocap_platform.models import ContactObservation, IdentityCandidate
+from mocap_platform.models import ContactObservation, IdentityCandidate, SupplementaryBatch
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -23,6 +24,155 @@ from mocap_platform.synthetic_multi import (
 
 
 class PlatformIntegrationTest(unittest.TestCase):
+    def test_supplements_combine_partial_tracks_with_raw_and_each_other(self) -> None:
+        contact = ContactObservation(
+            contact_id="contact_partial_supplement",
+            person_id="p0",
+            body_part="r_wrist",
+            object_id="ball",
+            start_frame=0,
+            end_frame=2,
+            source="manual_review",
+        )
+        raw_observations = [
+            {"p0_r_wrist": [0.0, 0.0, 0.0]},
+            {},
+            {"p0_r_wrist": [0.0, 0.0, 0.0]},
+        ]
+        objects = {
+            "ball": [
+                None,
+                [0.0, 0.0, 0.0],
+                None,
+            ]
+        }
+        object_only = SupplementaryBatch(
+            batch_id="batch_object_only",
+            object_id="ball",
+            tracks={
+                "object": {
+                    "start_frame": 0,
+                    "positions": [[0.05, 0.0, 0.0]],
+                }
+            },
+            source="manual_object_remeasure",
+            adopted_intervals=[{"start_frame": 0, "end_frame": 0}],
+            status="partially_adopted",
+        )
+        hand_only = SupplementaryBatch(
+            batch_id="batch_hand_only",
+            object_id="ball",
+            tracks={
+                "p0_r_wrist": {
+                    "start_frame": 1,
+                    "positions": [[0.0, 0.04, 0.0]],
+                }
+            },
+            source="manual_hand_remeasure",
+            adopted_intervals=[{"start_frame": 1, "end_frame": 1}],
+            status="partially_adopted",
+        )
+        pending_object = SupplementaryBatch(
+            batch_id="batch_pending_object",
+            object_id="ball",
+            tracks={
+                "object": {
+                    "start_frame": 2,
+                    "positions": [[0.0, 0.0, 0.0]],
+                }
+            },
+            source="manual_future_remeasure",
+        )
+        review = evaluate_supplementary_batches(
+            [object_only, hand_only, pending_object],
+            [contact],
+            [],
+            raw_observations,
+            objects,
+        )
+        by_batch = {item["batch_id"]: item for item in review["batch_results"]}
+        self.assertEqual(by_batch["batch_object_only"]["supported_frames"], [0])
+        self.assertEqual(by_batch["batch_hand_only"]["supported_frames"], [1])
+        self.assertEqual(by_batch["batch_pending_object"]["pending_frames"], [2])
+        self.assertEqual(by_batch["batch_pending_object"]["still_missing_frames"], [])
+        self.assertEqual(
+            review["still_missing_intervals"],
+            [{"start_frame": 2, "end_frame": 2}],
+        )
+
+    def test_adopted_supplement_conflicts_remain_unresolved_after_withdrawal(self) -> None:
+        contact = ContactObservation(
+            contact_id="contact_conflicting_supplement",
+            person_id="p0",
+            body_part="r_wrist",
+            object_id="ball",
+            start_frame=0,
+            end_frame=1,
+            source="manual_review",
+        )
+        raw_observations = [{"p0_r_wrist": [0.0, 0.0, 0.0]}, {}]
+        objects = {"ball": [None, [0.0, 0.0, 0.0]]}
+        supporting_object = SupplementaryBatch(
+            batch_id="batch_supporting_object",
+            object_id="ball",
+            tracks={
+                "object": {
+                    "start_frame": 0,
+                    "positions": [[0.05, 0.0, 0.0]],
+                }
+            },
+            source="manual_near_object",
+            adopted_intervals=[{"start_frame": 0, "end_frame": 0}],
+            status="partially_adopted",
+        )
+        conflicting_object = SupplementaryBatch(
+            batch_id="batch_conflicting_object",
+            object_id="ball",
+            tracks={
+                "object": {
+                    "start_frame": 0,
+                    "positions": [[0.9, 0.0, 0.0]],
+                }
+            },
+            source="manual_far_object",
+            adopted_intervals=[{"start_frame": 0, "end_frame": 0}],
+            status="partially_adopted",
+        )
+        withdrawn_hand = SupplementaryBatch(
+            batch_id="batch_withdrawn_hand",
+            object_id="ball",
+            tracks={
+                "p0_r_wrist": {
+                    "start_frame": 1,
+                    "positions": [[0.0, 0.0, 0.0]],
+                }
+            },
+            source="manual_withdrawn_hand",
+            adopted_intervals=[{"start_frame": 1, "end_frame": 1}],
+            status="withdrawn",
+        )
+        review = evaluate_supplementary_batches(
+            [supporting_object, conflicting_object, withdrawn_hand],
+            [contact],
+            [],
+            raw_observations,
+            objects,
+        )
+        self.assertEqual(
+            review["still_missing_intervals"], [{"start_frame": 1, "end_frame": 1}]
+        )
+        self.assertEqual(
+            [item["frame"] for item in review["source_conflicts"]], [0]
+        )
+        self.assertEqual(review["source_conflicts"][0]["resolution"], "unresolved")
+        self.assertEqual(
+            sorted(
+                item["batch_id"]
+                for item in review["source_conflicts"][0]["sources"]
+            ),
+            ["batch_conflicting_object", "batch_supporting_object"],
+        )
+
     def test_candidate_recheck_follows_revoked_evidence_and_decisions(self) -> None:
         candidate = IdentityCandidate(
             candidate_id="candidate_001",
@@ -883,8 +1033,8 @@ class PlatformIntegrationTest(unittest.TestCase):
             pending = {item["batch_id"]: item for item in v4["batch_results"]}
             primary_pending = pending["supplement_001_two_hand_remeasure"]
             self.assertEqual(primary_pending["status"], "pending")
-            self.assertEqual(primary_pending["pending_frames"], [22, 23])
-            self.assertEqual(primary_pending["still_missing_frames"], [27])
+            self.assertEqual(primary_pending["pending_frames"], [22, 23, 27])
+            self.assertEqual(primary_pending["still_missing_frames"], [])
             self.assertEqual(primary_pending["supported_frames"], [])
 
             # Partial adoption: supporting, contradicting and still-missing
@@ -895,8 +1045,9 @@ class PlatformIntegrationTest(unittest.TestCase):
             conflicting = batches["supplement_002_conflicting_remeasure"]
             self.assertEqual(primary["status"], "partially_adopted")
             self.assertEqual(primary["supported_frames"], [22, 23])
+            self.assertEqual(primary["pending_frames"], [27])
+            self.assertEqual(primary["still_missing_frames"], [])
             self.assertEqual(conflicting["contradicting_frames"], [22, 23])
-            self.assertEqual(primary["still_missing_frames"], [27])
             self.assertEqual(
                 review["still_missing_intervals"],
                 [{"start_frame": 27, "end_frame": 27}],

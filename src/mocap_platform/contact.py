@@ -334,6 +334,48 @@ def _intervals_contain(intervals: list[dict[str, int]], frame_index: int) -> boo
     )
 
 
+def _active_supplement_batches(batches: list[Any]) -> list[Any]:
+    return [
+        batch
+        for batch in batches
+        if getattr(batch, "status", "pending") != "withdrawn"
+    ]
+
+
+def _position_sources(
+    raw_point: list[float] | None,
+    target: str,
+    frame_index: int,
+    batches: list[Any],
+    body_marker: str = "",
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if raw_point is not None:
+        sources.append(
+            {
+                "source": "raw_observation",
+                "batch_id": None,
+                "target": target,
+                "position": raw_point,
+            }
+        )
+    for batch in _active_supplement_batches(batches):
+        point = _track_point(batch.tracks.get(target), frame_index)
+        if point is None or not _intervals_contain(
+            getattr(batch, "adopted_intervals", []), frame_index
+        ):
+            continue
+        sources.append(
+            {
+                "source": batch.source,
+                "batch_id": batch.batch_id,
+                "target": target,
+                "position": point,
+            }
+        )
+    return sources
+
+
 def evaluate_supplementary_batches(
     batches: list[Any],
     contacts: list[Any],
@@ -375,9 +417,12 @@ def evaluate_supplementary_batches(
         if getattr(candidate, "decision", "open") == "adopted"
     }
 
-    # frame_claims[(contact_id, frame)] lists per-batch adopted verdicts so
-    # duplicates and side-by-side conflicts can be derived afterwards.
+    # frame_claims[(contact_id, frame)] lists every adopted-source combination
+    # so cross-batch coverage, duplicates and unresolved conflicts retain their
+    # provenance instead of being overwritten by batch arrival order.
     frame_claims: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    source_conflicts: list[dict[str, Any]] = []
+    source_conflict_keys: set[tuple[Any, ...]] = set()
     batch_results: list[dict[str, Any]] = []
     for batch in batches:
         status = getattr(batch, "status", "pending")
@@ -400,6 +445,7 @@ def evaluate_supplementary_batches(
             )
             continue
         adopted_intervals = list(getattr(batch, "adopted_intervals", []))
+        active_batches = _active_supplement_batches(batches)
         contact_results: list[dict[str, Any]] = []
         supported: list[int] = []
         contradicting: list[int] = []
@@ -418,40 +464,165 @@ def evaluate_supplementary_batches(
             contact_pending: list[int] = []
             contact_missing: list[int] = []
             for frame_index in missing_by_contact.get(contact.contact_id, []):
-                object_point = _track_point(object_track, frame_index)
-                body_point = _track_point(body_track, frame_index)
-                if object_point is None or body_point is None:
+                raw_object_point = (
+                    objects.get(contact.object_id, [None] * (frame_index + 1))[
+                        frame_index
+                    ]
+                    if frame_index < len(objects.get(contact.object_id, []))
+                    else None
+                )
+                raw_body_point = (
+                    raw_observations[frame_index].get(body_marker)
+                    if frame_index < len(raw_observations)
+                    else None
+                )
+                current_object_point = _track_point(object_track, frame_index)
+                current_body_point = _track_point(body_track, frame_index)
+                current_object_adopted = current_object_point is not None and _intervals_contain(
+                    adopted_intervals, frame_index
+                )
+                current_body_adopted = current_body_point is not None and _intervals_contain(
+                    adopted_intervals, frame_index
+                )
+
+                object_sources = _position_sources(
+                    raw_object_point, OBJECT_TARGET, frame_index, active_batches
+                )
+                body_sources = _position_sources(
+                    raw_body_point, body_marker, frame_index, active_batches
+                )
+
+                def record_target_conflicts(
+                    target: str, sources: list[dict[str, Any]]
+                ) -> None:
+                    for first_index, first in enumerate(sources):
+                        for second in sources[first_index + 1 :]:
+                            if _distance(first["position"], second["position"]) <= tolerance:
+                                continue
+                            ordered_sources = tuple(
+                                sorted(
+                                    (
+                                        (
+                                            item["source"],
+                                            item["batch_id"] or "",
+                                            tuple(item["position"]),
+                                        )
+                                        for item in (first, second)
+                                    ),
+                                    key=lambda item: (item[1], item[0]),
+                                )
+                            )
+                            conflict_key = (
+                                contact.contact_id,
+                                frame_index,
+                                target,
+                                ordered_sources,
+                            )
+                            if conflict_key in source_conflict_keys:
+                                continue
+                            source_conflict_keys.add(conflict_key)
+                            source_conflicts.append(
+                                {
+                                    "contact_id": contact.contact_id,
+                                    "frame": frame_index,
+                                    "target": target,
+                                    "sources": [
+                                        {
+                                            "source": item["source"],
+                                            "batch_id": item["batch_id"],
+                                            "position": item["position"],
+                                        }
+                                        for item in (first, second)
+                                    ],
+                                    "resolution": "unresolved",
+                                }
+                            )
+
+                record_target_conflicts(OBJECT_TARGET, object_sources)
+                record_target_conflicts(body_marker, body_sources)
+
+                current_covers_missing_object = (
+                    raw_object_point is None and current_object_point is not None
+                )
+                current_covers_missing_body = (
+                    raw_body_point is None and current_body_point is not None
+                )
+                current_covers_gap = (
+                    current_covers_missing_object or current_covers_missing_body
+                )
+                available_with_current = (
+                    raw_object_point is not None or current_object_point is not None
+                ) and (
+                    raw_body_point is not None or current_body_point is not None
+                )
+                if not current_covers_gap:
+                    continue
+                if not available_with_current:
                     contact_missing.append(frame_index)
                     continue
-                if not _intervals_contain(adopted_intervals, frame_index):
+                if not current_object_adopted and not current_body_adopted:
                     contact_pending.append(frame_index)
                     continue
-                gap = _distance(body_point, object_point)
-                verdict = "supported" if gap <= tolerance else "contradicting"
-                frame_claims.setdefault((contact.contact_id, frame_index), []).append(
-                    {
-                        "batch_id": batch.batch_id,
-                        "verdict": verdict,
-                        "distance": gap,
-                    }
-                )
-                observations_used.append(
-                    {
-                        "frame": frame_index,
-                        "contact_id": contact.contact_id,
-                        "batch_id": batch.batch_id,
-                        "object_id": contact.object_id,
-                        "object_target": OBJECT_TARGET,
-                        "body_target": body_marker,
-                        "distance": gap,
-                        "verdict": verdict,
-                        "source": batch.source,
-                    }
-                )
-                if verdict == "supported":
+
+                frame_used = False
+                frame_verdicts: set[str] = set()
+                for object_source in object_sources:
+                    for body_source in body_sources:
+                        if batch.batch_id not in {
+                            object_source["batch_id"],
+                            body_source["batch_id"],
+                        }:
+                            continue
+                        gap = _distance(
+                            body_source["position"], object_source["position"]
+                        )
+                        verdict = "supported" if gap <= tolerance else "contradicting"
+                        claim = {
+                            "batch_id": batch.batch_id,
+                            "verdict": verdict,
+                            "distance": gap,
+                            "object_source": {
+                                "source": object_source["source"],
+                                "batch_id": object_source["batch_id"],
+                            },
+                            "body_source": {
+                                "source": body_source["source"],
+                                "batch_id": body_source["batch_id"],
+                            },
+                        }
+                        frame_claims.setdefault(
+                            (contact.contact_id, frame_index), []
+                        ).append(claim)
+                        observations_used.append(
+                            {
+                                "frame": frame_index,
+                                "contact_id": contact.contact_id,
+                                "batch_id": batch.batch_id,
+                                "object_id": contact.object_id,
+                                "object_target": OBJECT_TARGET,
+                                "body_target": body_marker,
+                                "distance": gap,
+                                "verdict": verdict,
+                                "source": batch.source,
+                                "object_position_source": object_source["source"],
+                                "object_position_batch_id": object_source["batch_id"],
+                                "body_position_source": body_source["source"],
+                                "body_position_batch_id": body_source["batch_id"],
+                            }
+                        )
+                        frame_used = True
+                        frame_verdicts.add(verdict)
+                if not frame_used:
+                    contact_missing.append(frame_index)
+                elif "contradicting" in frame_verdicts and "supported" in frame_verdicts:
+                    contact_supported.append(frame_index)
+                    contact_contradicting.append(
+                        {"frame": frame_index, "distance": None, "unresolved": True}
+                    )
+                elif "supported" in frame_verdicts:
                     contact_supported.append(frame_index)
                 else:
-                    contact_contradicting.append({"frame": frame_index, "distance": gap})
+                    contact_contradicting.append({"frame": frame_index, "distance": None})
             if not (
                 contact_supported
                 or contact_contradicting
@@ -499,12 +670,23 @@ def evaluate_supplementary_batches(
     duplicate_adoptions: list[dict[str, Any]] = []
     conflicting_supplements: list[dict[str, Any]] = []
     for (contact_id, frame_index), claims in sorted(frame_claims.items()):
-        if len(claims) > 1:
+        contributing_batches = sorted(
+            {
+                batch_id
+                for claim in claims
+                for batch_id in (
+                    claim["object_source"]["batch_id"],
+                    claim["body_source"]["batch_id"],
+                )
+                if batch_id is not None
+            }
+        )
+        if len(contributing_batches) > 1:
             duplicate_adoptions.append(
                 {
                     "contact_id": contact_id,
                     "frame": frame_index,
-                    "batch_ids": [claim["batch_id"] for claim in claims],
+                    "batch_ids": contributing_batches,
                     "note": "frame evidence counted once despite repeated adoption",
                 }
             )
@@ -518,11 +700,122 @@ def evaluate_supplementary_batches(
                 }
             )
 
+    effective_missing: list[tuple[int, int]] = []
+    combined_contact_results: list[dict[str, Any]] = []
+    for contact in active_contacts:
+        candidate = candidate_for_contact(candidates, contact)
+        body_marker = interpreted_body_marker(candidate, contact)
+        combined_supported: list[int] = []
+        combined_contradicting: list[dict[str, Any]] = []
+        combined_missing: list[int] = []
+        combined_evidence: list[dict[str, Any]] = []
+        for frame_index in missing_by_contact.get(contact.contact_id, []):
+            raw_object_point = (
+                objects.get(contact.object_id, [])[frame_index]
+                if frame_index < len(objects.get(contact.object_id, []))
+                else None
+            )
+            raw_body_point = (
+                raw_observations[frame_index].get(body_marker)
+                if frame_index < len(raw_observations)
+                else None
+            )
+            adopted_object_available = raw_object_point is not None or any(
+                getattr(batch, "status", "pending") != "withdrawn"
+                and _track_point(batch.tracks.get(OBJECT_TARGET), frame_index) is not None
+                and _intervals_contain(
+                    getattr(batch, "adopted_intervals", []), frame_index
+                )
+                for batch in batches
+            )
+            adopted_body_available = raw_body_point is not None or any(
+                getattr(batch, "status", "pending") != "withdrawn"
+                and _track_point(batch.tracks.get(body_marker), frame_index) is not None
+                and _intervals_contain(
+                    getattr(batch, "adopted_intervals", []), frame_index
+                )
+                for batch in batches
+            )
+            if not adopted_object_available or not adopted_body_available:
+                effective_missing.append((frame_index, frame_index))
+                combined_missing.append(frame_index)
+                continue
+            object_sources = _position_sources(
+                raw_object_point, OBJECT_TARGET, frame_index, batches
+            )
+            body_sources = _position_sources(
+                raw_body_point, body_marker, frame_index, batches
+            )
+            frame_verdicts = set()
+            for object_source in object_sources:
+                for body_source in body_sources:
+                    gap = _distance(
+                        body_source["position"], object_source["position"]
+                    )
+                    verdict = "supported" if gap <= tolerance else "contradicting"
+                    frame_verdicts.add(verdict)
+                    combined_evidence.append(
+                        {
+                            "frame": frame_index,
+                            "contact_id": contact.contact_id,
+                            "object_id": contact.object_id,
+                            "body_target": body_marker,
+                            "distance": gap,
+                            "verdict": verdict,
+                            "object_source": {
+                                "source": object_source["source"],
+                                "batch_id": object_source["batch_id"],
+                            },
+                            "body_source": {
+                                "source": body_source["source"],
+                                "batch_id": body_source["batch_id"],
+                            },
+                        }
+                    )
+            if "supported" in frame_verdicts and "contradicting" in frame_verdicts:
+                combined_supported.append(frame_index)
+                combined_contradicting.append(
+                    {"frame": frame_index, "distance": None, "unresolved": True}
+                )
+            elif "supported" in frame_verdicts:
+                combined_supported.append(frame_index)
+            else:
+                combined_contradicting.append(
+                    {"frame": frame_index, "distance": None}
+                )
+        combined_contact_results.append(
+            {
+                "contact_id": contact.contact_id,
+                "candidate_id": confirmed_by_contact.get(contact.contact_id),
+                "protected_by_confirmed_decision": (
+                    confirmed_by_contact.get(contact.contact_id) in adopted_candidate_ids
+                ),
+                "supported_frames": combined_supported,
+                "contradicting_frames": combined_contradicting,
+                "still_missing_frames": combined_missing,
+                "supported_intervals": _merge_intervals(
+                    [(frame, frame) for frame in combined_supported]
+                ),
+                "conflict_intervals": _merge_intervals(
+                    [
+                        (item["frame"], item["frame"])
+                        for item in combined_contradicting
+                    ]
+                ),
+                "missing_intervals": _merge_intervals(
+                    [(frame, frame) for frame in combined_missing]
+                ),
+                "observations_used": combined_evidence,
+            }
+        )
+
     return {
         "tolerance": tolerance,
         "batch_results": batch_results,
+        "combined_contact_results": combined_contact_results,
         "duplicate_adoptions": duplicate_adoptions,
         "conflicting_supplements": conflicting_supplements,
+        "source_conflicts": source_conflicts,
         "supported_intervals": _merge_intervals(
             [
                 (frame, frame)
@@ -538,10 +831,6 @@ def evaluate_supplementary_batches(
             ]
         ),
         "still_missing_intervals": _merge_intervals(
-            [
-                (frame, frame)
-                for result in batch_results
-                for frame in result["still_missing_frames"]
-            ]
+            effective_missing
         ),
     }
