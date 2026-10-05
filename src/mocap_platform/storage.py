@@ -15,6 +15,8 @@ from .models import (
     IdentityScheme,
     ObjectTrack,
     ProcessingVersion,
+    SupplementAdoption,
+    SupplementBatch,
     TrajectoryReassignment,
     utc_now,
 )
@@ -415,6 +417,128 @@ class PlatformStore:
         if not directory.exists():
             return []
         return [read_json(path) for path in sorted(directory.glob("*.json"))]
+
+    def supplements_dir(self, action_name: str, pipeline_name: str) -> Path:
+        return self.processing_dir(action_name, pipeline_name) / "supplements"
+
+    def save_supplement_batch(
+        self, action_name: str, pipeline_name: str, batch: SupplementBatch
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        path = directory / f"{batch.batch_id}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"supplement batch is immutable and already exists: {path}"
+            )
+        atomic_write_json(path, batch.to_dict())
+        return path
+
+    def revoke_supplement_batch(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        batch_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        batch_path = directory / f"{batch_id}.json"
+        if not batch_path.exists():
+            raise FileNotFoundError(
+                f"cannot revoke unknown supplement batch: {batch_path}"
+            )
+        path = directory / f"{batch_id}.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"supplement batch already revoked: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "supplement_batch_revocation",
+                "batch_id": batch_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_supplement_batches(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".revocation.json")]
+            for path in directory.glob("*.revocation.json")
+        }
+        batches: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(
+                (".revocation.json", ".adoption.json", ".adoption.revocation.json")
+            ):
+                continue
+            data = read_json(path)
+            if data["batch_id"] in revoked:
+                data["status"] = "revoked"
+            batches.append(data)
+        return batches
+
+    def save_supplement_adoption(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        adoption: SupplementAdoption,
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        path = directory / f"{adoption.adoption_id}.adoption.json"
+        if path.exists():
+            raise FileExistsError(f"supplement adoption already recorded: {path}")
+        atomic_write_json(path, adoption.to_dict())
+        return path
+
+    def revoke_supplement_adoption(
+        self,
+        action_name: str,
+        pipeline_name: str,
+        adoption_id: str,
+        reason: str = "",
+    ) -> Path:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        base_path = directory / f"{adoption_id}.adoption.json"
+        if not base_path.exists():
+            raise FileNotFoundError(
+                f"cannot revoke unknown supplement adoption: {base_path}"
+            )
+        path = directory / f"{adoption_id}.adoption.revocation.json"
+        if path.exists():
+            raise FileExistsError(f"supplement adoption already revoked: {path}")
+        atomic_write_json(
+            path,
+            {
+                "kind": "supplement_adoption_revocation",
+                "adoption_id": adoption_id,
+                "reason": reason,
+                "revoked_at": utc_now(),
+            },
+        )
+        return path
+
+    def load_supplement_adoptions(
+        self, action_name: str, pipeline_name: str
+    ) -> list[dict[str, Any]]:
+        directory = self.supplements_dir(action_name, pipeline_name)
+        if not directory.exists():
+            return []
+        revoked = {
+            path.name[: -len(".adoption.revocation.json")]
+            for path in directory.glob("*.adoption.revocation.json")
+        }
+        adoptions: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.adoption.json")):
+            data = read_json(path)
+            if data["adoption_id"] in revoked:
+                data["status"] = "revoked"
+            adoptions.append(data)
+        return adoptions
 
     @staticmethod
     def _lineage(result: ProcessingVersion) -> dict[str, Any]:

@@ -12,7 +12,15 @@ from mocap_platform.contact import (
     candidates_dependent_on,
     evaluate_contact_compatibility,
 )
-from mocap_platform.models import ContactObservation, IdentityCandidate
+from mocap_platform.models import (
+    ContactObservation,
+    IdentityCandidate,
+    SupplementAdoption,
+    SupplementBatch,
+    SupplementSelection,
+    SupplementTrack,
+)
+from mocap_platform.contact import resolve_supplement_points
 from mocap_platform.reconstruction import reconstruct
 from mocap_platform.storage import PlatformStore
 from mocap_platform.synthetic import generate_known_action, inject_occlusions_and_swaps
@@ -669,7 +677,7 @@ class PlatformIntegrationTest(unittest.TestCase):
                 ],
                 "active",
             )
-            self.assertEqual(len(store.load_schemes(action, pipeline)), 3)
+            self.assertEqual(len(store.load_schemes(action, pipeline)), 4)
             self.assertIn("ball_01", store.load_object_tracks(action, pipeline))
 
             export = json.loads(
@@ -704,10 +712,74 @@ class PlatformIntegrationTest(unittest.TestCase):
                     "decision_reason"
                 ],
             )
-            self.assertEqual(len(export["identity_schemes"]), 3)
+            self.assertEqual(len(export["identity_schemes"]), 4)
             self.assertEqual(
                 export["object_tracks"]["ball_01"]["positions"][27], None
             )
+
+            # Supplemental batches: pending v004, partial adoption v005,
+            # one-batch revocation v006.
+            def supplement_summary(version: str) -> dict:
+                return load(version)["parameters"]["supplement_review"]
+
+            v4_summary = supplement_summary("v004")
+            self.assertEqual(v4_summary["supported_intervals"], [])
+            self.assertEqual(
+                v4_summary["still_missing_intervals"],
+                [{"start_frame": 22, "end_frame": 23}, {"start_frame": 27, "end_frame": 27}],
+            )
+            self.assertTrue(v4_summary["pending_intervals"])
+
+            v5_summary = supplement_summary("v005")
+            self.assertEqual(
+                v5_summary["supported_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            self.assertEqual(
+                v5_summary["conflicting_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            self.assertEqual(v5_summary["still_missing_intervals"], [])
+            self.assertIn(24, v5_summary["duplicate_frames"])
+
+            v6_summary = supplement_summary("v006")
+            self.assertEqual(v6_summary["conflicting_intervals"], [])
+            self.assertEqual(
+                v6_summary["supported_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            v6_parameters = load("v006")["parameters"]
+            self.assertIn(
+                "candidate_supplement_reshoot_grip",
+                v6_parameters["contact_dependent_candidates"],
+            )
+            self.assertIn(
+                "scheme_004_reshoot_grip",
+                v6_parameters["contact_dependent_schemes"],
+            )
+
+            # The export carries batches, adoptions and per-frame provenance.
+            batch_status = {
+                item["batch_id"]: item["status"]
+                for item in export["supplement_batches"]
+            }
+            self.assertEqual(
+                batch_status,
+                {
+                    "supplement_batch_001_long_overlap": "active",
+                    "supplement_batch_002_short_partial_overlap": "revoked",
+                },
+            )
+            self.assertEqual(len(export["supplement_adoptions"]), 2)
+            provenance = export["frame_observation_provenance"][
+                "contact_001_p0_left_hand_ball_during_crossing"
+            ]
+            self.assertEqual(
+                provenance["27"]["object_batch_id"],
+                "supplement_batch_001_long_overlap",
+            )
+            self.assertEqual(provenance["24"]["object_batch_id"], None)
+            self.assertEqual(provenance["24"]["object_source"], "raw_observation")
 
     def test_contact_annotation_beyond_capture_length_stays_missing(self) -> None:
         # Five observed frames (0-4); annotations reach frame 7. Frames past
@@ -808,6 +880,8 @@ class PlatformIntegrationTest(unittest.TestCase):
                     "object_id": "ball",
                     "contacts": ["contact_grasp_p0", "contact_grasp_p1"],
                     "markers": ["p0_l_wrist", "p1_r_wrist"],
+                    "body_batch_ids": [None, None],
+                    "object_batch_id": None,
                 }
             ],
         )
@@ -859,6 +933,326 @@ class PlatformIntegrationTest(unittest.TestCase):
             # Raw observations were never overwritten by interpolated values.
             self.assertIsNone(raw_observations[4]["p1_r_wrist"])
             self.assertEqual(len(raw_observations), 5)
+
+
+class SupplementalObservationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Five frames. The object is missing on frames 1-2; each hand track is
+        # missing on a different frame so the supplemental tracks handed in
+        # later have different lengths and only partially overlap.
+        self.observations = [
+            {
+                "p0_l_wrist": [0.0, 0.0, 0.0],
+                "p1_r_wrist": [0.0, 0.0, 0.0],
+            },
+            {  # frame 1: p0 hand missing
+                "p0_l_wrist": None,
+                "p1_r_wrist": [0.0, 0.0, 0.0],
+            },
+            {  # frame 2: p1 hand missing
+                "p0_l_wrist": [0.0, 0.0, 0.0],
+                "p1_r_wrist": None,
+            },
+            {
+                "p0_l_wrist": [0.0, 0.0, 0.0],
+                "p1_r_wrist": [0.0, 0.0, 0.0],
+            },
+            {
+                "p0_l_wrist": [0.0, 0.0, 0.0],
+                "p1_r_wrist": [0.0, 0.0, 0.0],
+            },
+        ]
+        self.objects = {
+            "ball": [
+                [0.0, 0.0, 0.0],
+                None,
+                None,
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        }
+        self.contacts = [
+            ContactObservation(
+                contact_id="contact_p0",
+                person_id="p0",
+                body_part="l_wrist",
+                object_id="ball",
+                start_frame=0,
+                end_frame=2,
+                source="manual_review",
+                simultaneous_with=["contact_p1"],
+            ),
+            ContactObservation(
+                contact_id="contact_p1",
+                person_id="p1",
+                body_part="r_wrist",
+                object_id="ball",
+                start_frame=0,
+                end_frame=2,
+                source="manual_review",
+                simultaneous_with=["contact_p0"],
+            ),
+        ]
+
+    def _batches(self) -> list[SupplementBatch]:
+        long_batch = SupplementBatch(
+            batch_id="batch_long",
+            object_id="ball",
+            source="reshoot_overhead",
+            tracks=[
+                SupplementTrack(
+                    subject_id="ball",
+                    subject_kind="object",
+                    start_frame=1,
+                    points=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                ),
+                SupplementTrack(
+                    subject_id="p0_l_wrist",
+                    subject_kind="body",
+                    start_frame=1,
+                    points=[[0.0, 0.0, 0.0]],
+                ),
+            ],
+        )
+        short_batch = SupplementBatch(
+            batch_id="batch_short",
+            object_id="ball",
+            source="reshoot_side",
+            tracks=[
+                # Frame 2 duplicates the long ball point; a hypothetical extra
+                # frame 3 would land on an already-observed frame.
+                SupplementTrack(
+                    subject_id="ball",
+                    subject_kind="object",
+                    start_frame=2,
+                    points=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                ),
+                SupplementTrack(
+                    subject_id="p1_r_wrist",
+                    subject_kind="body",
+                    start_frame=2,
+                    points=[[0.0, 0.0, 0.0]],
+                ),
+            ],
+        )
+        return [long_batch, short_batch]
+
+    def _adoptions(self) -> list[SupplementAdoption]:
+        return [
+            SupplementAdoption(
+                adoption_id="adopt_long",
+                batch_id="batch_long",
+                object_id="ball",
+                selections=[
+                    SupplementSelection("ball", "object", 1, 1),
+                    SupplementSelection("p0_l_wrist", "body", 1, 1),
+                ],
+            ),
+            SupplementAdoption(
+                adoption_id="adopt_short",
+                batch_id="batch_short",
+                object_id="ball",
+                selections=[
+                    SupplementSelection("ball", "object", 2, 3),
+                    SupplementSelection("p1_r_wrist", "body", 2, 2),
+                ],
+            ),
+        ]
+
+    def test_pending_batches_leave_old_gaps_and_show_material_side_by_side(
+        self,
+    ) -> None:
+        review = evaluate_contact_compatibility(
+            self.contacts,
+            [],
+            self.observations,
+            self.objects,
+            supplement_index=resolve_supplement_points(self._batches(), []),
+        )
+        results = {item["contact_id"]: item for item in review["contact_results"]}
+        # No adoption yet: frames 1-2 remain missing exactly as in v1.
+        self.assertEqual(
+            results["contact_p0"]["missing_observation_frames"], [1, 2]
+        )
+        self.assertEqual(results["contact_p0"]["supported_frames"], [0])
+        self.assertEqual(results["contact_p0"]["verdict"], "still_plausible")
+        # Pending material is listed per frame for reviewer selection.
+        self.assertEqual(
+            sorted(set(results["contact_p0"]["pending_supplement_frames"])),
+            [1, 2],
+        )
+        pending = review["supplement_review"]["pending_intervals"]
+        self.assertEqual(pending, [{"start_frame": 1, "end_frame": 3}])
+
+    def test_partial_adoption_fills_only_chosen_gaps_with_provenance(self) -> None:
+        review = evaluate_contact_compatibility(
+            self.contacts,
+            [],
+            self.observations,
+            self.objects,
+            supplement_index=resolve_supplement_points(
+                self._batches(), self._adoptions()
+            ),
+        )
+        results = {item["contact_id"]: item for item in review["contact_results"]}
+        # Both previously missing frames are supported by supplemental data.
+        self.assertEqual(results["contact_p0"]["supported_frames"], [0, 1, 2])
+        self.assertEqual(
+            results["contact_p0"]["supported_by_supplement_frames"], [1, 2]
+        )
+        self.assertEqual(results["contact_p0"]["missing_observation_frames"], [])
+        provenance = {
+            item["frame"]: item
+            for item in results["contact_p0"]["observations_used"]
+        }
+        self.assertIsNone(provenance[0]["body_batch_id"])
+        self.assertEqual(provenance[0]["body_source"], "raw_observation")
+        self.assertEqual(provenance[1]["body_batch_id"], "batch_long")
+        self.assertEqual(provenance[1]["object_batch_id"], "batch_long")
+        self.assertEqual(provenance[2]["object_batch_id"], "batch_short")
+        # Frame 3's ball supplement repeats a frame the original analysis
+        # already saw; it must not add evidence.
+        self.assertIn(3, review["supplement_review"]["duplicate_frames"])
+        # Both hands touch simultaneously on the supplemented frame 2.
+        simultaneous = {
+            item["frame"]: item
+            for item in review["simultaneous_contacts"]
+        }
+        self.assertIn(2, simultaneous)
+        self.assertEqual(
+            simultaneous[2]["body_batch_ids"],
+            # Frame 2's p0 hand was visible in the original capture (raw wins);
+            # only p1's hand comes from the supplemental short batch.
+            [None, "batch_short"],
+        )
+
+    def test_conflicting_adopted_ball_points_listed_side_by_side(self) -> None:
+        batches = self._batches()
+        # Make the long batch disagree with the short one at frame 2.
+        batches[0].tracks[0].points[1] = [2.0, 0.0, 0.0]
+        adoptions = self._adoptions()
+        # Both batches must be adopted at frame 2 for the contradiction to be
+        # visible (pending material is shown separately, not as a conflict).
+        adoptions[0].selections[0].end_frame = 2
+        review = evaluate_contact_compatibility(
+            self.contacts,
+            [],
+            self.observations,
+            self.objects,
+            supplement_index=resolve_supplement_points(
+                batches, adoptions
+            ),
+        )
+        results = {item["contact_id"]: item for item in review["contact_results"]}
+        p1_result = results["contact_p1"]
+        # One adopted ball point (batch_short at origin) still supports contact;
+        # the contradictory batch_long point is listed rather than chosen.
+        self.assertEqual(p1_result["verdict"], "still_plausible")
+        self.assertIn(2, p1_result["supported_by_supplement_frames"])
+        conflict_frames = {
+            item["frame"]: item
+            for item in p1_result["conflicting_supplements"]
+        }
+        self.assertIn(2, conflict_frames)
+        self.assertEqual(
+            conflict_frames[2]["batches"], ["batch_long", "batch_short"]
+        )
+        self.assertEqual(
+            review["supplement_review"]["conflicting_intervals"],
+            [{"start_frame": 2, "end_frame": 2}],
+        )
+
+    def test_revoked_batch_only_removes_its_own_interpretations(self) -> None:
+        batches = self._batches()
+        batches[1].status = "revoked"
+        review = evaluate_contact_compatibility(
+            self.contacts,
+            [],
+            self.observations,
+            self.objects,
+            supplement_index=resolve_supplement_points(
+                batches, self._adoptions()
+            ),
+        )
+        results = {item["contact_id"]: item for item in review["contact_results"]}
+        # Long-batch frame 1 support survives; frame 2 (short batch) is missing
+        # again, and no short-batch duplicates remain.
+        self.assertEqual(
+            results["contact_p0"]["supported_by_supplement_frames"], [1]
+        )
+        self.assertEqual(results["contact_p1"]["missing_observation_frames"], [2])
+        self.assertEqual(review["supplement_review"]["duplicate_frames"], [])
+        # A candidate depending on the revoked batch is flagged for recheck.
+        dependent = IdentityCandidate(
+            candidate_id="candidate_needs_short",
+            person_id="p1",
+            joint_mapping={"r_wrist": "p1_r_wrist"},
+            start_frame=0,
+            end_frame=2,
+            depends_on=["batch_short"],
+        )
+        self.assertEqual(
+            candidates_dependent_on(
+                [dependent], set(), set() | {"batch_short"}
+            ),
+            ["candidate_needs_short"],
+        )
+
+    def test_pending_save_reopen_partial_adopt_and_export_traceability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = PlatformStore(directory)
+            action = "demo_action"
+            pipeline = "supplement_reopen_review"
+            for batch in self._batches():
+                store.save_supplement_batch(action, pipeline, batch)
+            batches = [
+                SupplementBatch.from_dict(data)
+                for data in store.load_supplement_batches(action, pipeline)
+            ]
+            # Reopen: batches reload as active with no adoptions yet.
+            self.assertEqual(
+                [batch.batch_id for batch in batches],
+                ["batch_long", "batch_short"],
+            )
+            adoption = self._adoptions()[0]
+            store.save_supplement_adoption(action, pipeline, adoption)
+            reloaded_adoptions = [
+                SupplementAdoption.from_dict(data)
+                for data in store.load_supplement_adoptions(action, pipeline)
+            ]
+            review = evaluate_contact_compatibility(
+                self.contacts,
+                [],
+                self.observations,
+                self.objects,
+                supplement_index=resolve_supplement_points(
+                    batches, reloaded_adoptions
+                ),
+            )
+            results = {item["contact_id"]: item for item in review["contact_results"]}
+            # Only the long batch is adopted: frame 1 filled, frame 2 remains
+            # missing even though the short batch covers it (pending).
+            self.assertEqual(
+                results["contact_p0"]["supported_by_supplement_frames"], [1]
+            )
+            self.assertEqual(results["contact_p0"]["missing_observation_frames"], [2])
+            self.assertEqual(
+                results["contact_p0"]["pending_supplement_frames"], [2]
+            )
+            # Revoking the batch removes only its own evidence and adoption
+            # effects; manual contact annotations stay active and untouched.
+            store.revoke_supplement_batch(
+                action, pipeline, "batch_long", reason="recut"
+            )
+            reloaded = {
+                data["batch_id"]: data["status"]
+                for data in store.load_supplement_batches(action, pipeline)
+            }
+            self.assertEqual(
+                reloaded, {"batch_long": "revoked", "batch_short": "active"}
+            )
 
 
 if __name__ == "__main__":

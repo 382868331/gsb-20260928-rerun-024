@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 
 from .calibration import calibrate_from_action
@@ -15,6 +16,10 @@ from .models import (
     CaptureRecord,
     IdentityDecision,
     IdentityRevision,
+    SupplementAdoption,
+    SupplementBatch,
+    SupplementSelection,
+    SupplementTrack,
     TrajectoryReassignment,
 )
 from .synthetic_multi import (
@@ -595,6 +600,14 @@ def demo(output: str) -> None:
     contact_pipeline = "contact_evidence_review"
     contact_capture_id = scoped_capture_id
 
+    # The contact review additionally loses both hand tracks at one ball
+    # gap frame; supplemental batches handed in later target exactly these
+    # missing ranges. The original capture stays untouched.
+    contact_observed = copy.deepcopy(scoped_observed)
+    for frame_index in (23, 27):
+        contact_observed[frame_index]["p0_l_wrist"] = None
+        contact_observed[frame_index]["p1_r_wrist"] = None
+
     def ball_position(frame_index: int) -> list[float] | None:
         # The ball follows the true p0 left wrist path; during the crossing that
         # path is observed under the swapped ``p1_r_wrist`` label.
@@ -712,6 +725,22 @@ def demo(output: str) -> None:
     for candidate in (candidate_swap, candidate_no_swap, candidate_double_claim):
         store.save_candidate(action_name, contact_pipeline, candidate)
 
+    # A later interpretation becomes possible only once the long supplemental
+    # batch exists; revoking that batch must return it to recheck while the
+    # contact-based candidates remain as they were.
+    candidate_supplement_grip = IdentityCandidate(
+        candidate_id="candidate_supplement_reshoot_grip",
+        person_id="p0",
+        joint_mapping={"l_wrist": "p1_r_wrist"},
+        start_frame=22,
+        end_frame=27,
+        reason="overhead reshoot confirms the same grip through the ball gaps",
+        depends_on=["supplement_batch_002_short_partial_overlap"],
+    )
+    store.save_candidate(
+        action_name, contact_pipeline, candidate_supplement_grip
+    )
+
     scheme_swap = IdentityScheme(
         scheme_id="scheme_001_arm_swap",
         label="p0 left arm follows the track currently labeled p1 right arm",
@@ -742,12 +771,111 @@ def demo(output: str) -> None:
     for scheme in (scheme_swap, scheme_keep, scheme_conflict):
         store.save_scheme(action_name, contact_pipeline, scheme)
 
+    scheme_reshoot = IdentityScheme(
+        scheme_id="scheme_004_reshoot_grip",
+        label="the reshoot confirms the swapped grip across the gaps",
+        crossing_start_frame=22,
+        crossing_end_frame=27,
+        candidate_ids=[
+            candidate_swap.candidate_id,
+            candidate_supplement_grip.candidate_id,
+        ],
+        notes="Exists only while the long supplemental batch is active.",
+        status="open",
+    )
+    store.save_scheme(action_name, contact_pipeline, scheme_reshoot)
+
     contact_objects = {ball_track.object_id: ball_track.positions}
+
+    # --- Supplemental observation batches handed in after v1 ---------------
+    # Batch A is long (frames 22-27); batch B is short (frames 23-27) and
+    # partially overlaps. At frames 22/23/27 the original object track is
+    # missing and at 23/27 both hand tracks are missing in this review copy.
+    def _truth_point(frame_index: int, marker: str) -> list[float]:
+        return list(scoped_truth[frame_index][marker])
+
+    supplement_frames_long = range(22, 28)
+    supplement_frames_short = range(23, 28)
+
+    def _reshoot_ball_point(frame_index: int) -> list[float]:
+        # The reshoot reveals the ball even on frames the original track
+        # marked missing (22, 23, 27); mirror ``ball_position`` otherwise.
+        point = scoped_truth[frame_index]["p0_l_wrist"]
+        if 20 <= frame_index <= 24:
+            return [
+                (point[axis] + scoped_truth[frame_index]["p1_r_wrist"][axis]) / 2
+                for axis in range(3)
+            ]
+        return list(point)
+
+    supplement_batch_a = SupplementBatch(
+        batch_id="supplement_batch_001_long_overlap",
+        object_id="ball_01",
+        source="reshoot_overhead_camera",
+        reason="reshoot overhead view covers the crossing and the ball gaps",
+        tracks=[
+            SupplementTrack(
+                subject_id="ball_01",
+                subject_kind="object",
+                start_frame=22,
+                points=[
+                    _reshoot_ball_point(index) for index in supplement_frames_long
+                ],
+            ),
+            SupplementTrack(
+                subject_id="p1_r_wrist",
+                subject_kind="body",
+                start_frame=23,
+                points=[
+                    _truth_point(index, "p0_l_wrist")
+                    for index in range(23, 28)
+                ],
+            ),
+            SupplementTrack(
+                subject_id="p0_l_wrist",
+                subject_kind="body",
+                start_frame=23,
+                points=[
+                    _truth_point(index, "p0_l_wrist")
+                    for index in range(23, 28)
+                ],
+            ),
+        ],
+    )
+    far_point = _truth_point(27, "p0_l_wrist")
+    contradicting_ball_27 = [axis + 1.5 for axis in far_point]
+    supplement_batch_b = SupplementBatch(
+        batch_id="supplement_batch_002_short_partial_overlap",
+        object_id="ball_01",
+        source="reshoot_side_camera",
+        reason=("side-camera reshoot overlaps the long batch; its last ball "
+                "frame disagrees and stays available for side-by-side review"),
+        tracks=[
+            SupplementTrack(
+                subject_id="ball_01",
+                subject_kind="object",
+                start_frame=23,
+                # Frame 27 deliberately contradicts batch A's ball point.
+                points=[
+                    *[_reshoot_ball_point(index) for index in range(23, 27)],
+                    contradicting_ball_27,
+                ],
+            ),
+            SupplementTrack(
+                subject_id="p0_l_wrist",
+                subject_kind="body",
+                start_frame=27,
+                points=[_truth_point(27, "p0_l_wrist")],
+            ),
+        ],
+    )
+    for batch in (supplement_batch_a, supplement_batch_b):
+        store.save_supplement_batch(action_name, contact_pipeline, batch)
     contact_v1 = reconstruct(
         action_name,
         contact_pipeline,
         contact_capture_id,
-        scoped_observed,
+        contact_observed,
         scoped_calibration_dict,
         contact_observations=[
             crossing_contact_p0,
@@ -756,9 +884,9 @@ def demo(output: str) -> None:
             automatic_hint,
             short_occlusion_contact,
         ],
-        identity_candidates=[candidate_swap, candidate_no_swap, candidate_double_claim],
+        identity_candidates=[candidate_swap, candidate_no_swap, candidate_double_claim, candidate_supplement_grip],
         contact_objects=contact_objects,
-        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict],
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
         ambiguity_windows=scoped_windows,
     )
     store.save_processing(contact_v1)
@@ -787,7 +915,7 @@ def demo(output: str) -> None:
         action_name,
         contact_pipeline,
         contact_capture_id,
-        scoped_observed,
+        contact_observed,
         scoped_calibration_dict,
         contact_observations=[
             crossing_contact_p0,
@@ -798,7 +926,7 @@ def demo(output: str) -> None:
         ],
         identity_candidates=adopted_candidates,
         contact_objects=contact_objects,
-        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict],
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
         ambiguity_windows=scoped_windows,
         based_on=contact_v1,
     )
@@ -820,26 +948,155 @@ def demo(output: str) -> None:
         action_name,
         contact_pipeline,
         contact_capture_id,
-        scoped_observed,
+        contact_observed,
         scoped_calibration_dict,
         contact_observations=reloaded_contacts,
         identity_candidates=adopted_candidates,
         contact_objects=contact_objects,
-        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict],
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
         ambiguity_windows=scoped_windows,
         based_on=contact_v2,
     )
     store.save_processing(contact_v3)
 
+    # v004: both supplemental batches are saved as undecided evidence. Pending
+    # material is listed side by side; adopted intervals are empty, so the
+    # original missing frames and the confirmed manual contacts are unchanged.
+    pending_batches = [
+        SupplementBatch.from_dict(data)
+        for data in store.load_supplement_batches(action_name, contact_pipeline)
+    ]
+    contact_v4 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        contact_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=adopted_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
+        supplement_batches=pending_batches,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v3,
+    )
+    store.save_processing(contact_v4)
+
+    # Reopening the review: the reviewer partially adopts the long batch for
+    # ball gaps 22-27, and adopts the overlapping short batch at 23-27: its
+    # 23-26 points duplicate the long batch (no added evidence) while its
+    # frame-27 point contradicts it and stays visible side by side. Adoption
+    # is per interval and never edits the immutable ball/contact records.
+    adoption_long = SupplementAdoption(
+        adoption_id="supplement_adoption_001_partial_long_batch",
+        batch_id=supplement_batch_a.batch_id,
+        object_id="ball_01",
+        selections=[
+            SupplementSelection(
+                subject_id="ball_01",
+                subject_kind="object",
+                start_frame=22,
+                end_frame=27,
+            ),
+            SupplementSelection(
+                subject_id="p1_r_wrist",
+                subject_kind="body",
+                start_frame=23,
+                end_frame=27,
+            ),
+            SupplementSelection(
+                subject_id="p0_l_wrist",
+                subject_kind="body",
+                start_frame=23,
+                end_frame=27,
+            ),
+        ],
+        reason="use the overhead reshoot only for the early crossing gaps",
+    )
+    store.save_supplement_adoption(
+        action_name, contact_pipeline, adoption_long
+    )
+    adoption_short = SupplementAdoption(
+        adoption_id="supplement_adoption_002_partial_short_batch",
+        batch_id=supplement_batch_b.batch_id,
+        object_id="ball_01",
+        selections=[
+            SupplementSelection(
+                subject_id="ball_01",
+                subject_kind="object",
+                # Frames 23-26 repeat batch A (duplicate, no added evidence);
+                # frame 27 contradicts batch A and is shown side by side.
+                start_frame=23,
+                end_frame=27,
+            ),
+        ],
+        reason="overlapping reshoot duplicates early gaps and disputes frame 27",
+    )
+    store.save_supplement_adoption(
+        action_name, contact_pipeline, adoption_short
+    )
+    reloaded_adoptions = [
+        SupplementAdoption.from_dict(data)
+        for data in store.load_supplement_adoptions(action_name, contact_pipeline)
+    ]
+    contact_v5 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        contact_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=adopted_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
+        supplement_batches=pending_batches,
+        supplement_adoptions=reloaded_adoptions,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v4,
+    )
+    store.save_processing(contact_v5)
+
+    # Withdrawing one batch removes only interpretations depending on it;
+    # intervals adopted from the other batch and manual contact annotations
+    # remain intact.
+    store.revoke_supplement_batch(
+        action_name,
+        contact_pipeline,
+        supplement_batch_b.batch_id,
+        reason="side-camera reshoot withdrawn for recalibration; frame 27 reopens",
+    )
+    reloaded_batches = [
+        SupplementBatch.from_dict(data)
+        for data in store.load_supplement_batches(action_name, contact_pipeline)
+    ]
+    contact_v6 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        contact_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=adopted_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
+        supplement_batches=reloaded_batches,
+        supplement_adoptions=reloaded_adoptions,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v5,
+    )
+    store.save_processing(contact_v6)
+
     contact_export = build_review_export(
         store.load_capture(contact_capture_id),
-        contact_v3.to_dict(),
+        contact_v6.to_dict(),
         [],
         [],
         contacts=reloaded_contacts,
         candidates=adopted_candidates,
-        schemes=[scheme_swap, scheme_keep, scheme_conflict],
+        schemes=[scheme_swap, scheme_keep, scheme_conflict, scheme_reshoot],
         object_tracks=store.load_object_tracks(action_name, contact_pipeline),
+        supplement_batches=reloaded_batches,
+        supplement_adoptions=reloaded_adoptions,
     )
     store.save_review_export(action_name, contact_pipeline, contact_export)
     contact_report = {
@@ -852,6 +1109,11 @@ def demo(output: str) -> None:
         "contact_dependent_schemes": contact_v3.parameters[
             "contact_dependent_schemes"
         ],
+        "supplement_review_pending": contact_v4.parameters["supplement_review"],
+        "supplement_review_adopted": contact_v5.parameters["supplement_review"],
+        "supplement_review_after_revocation": contact_v6.parameters[
+            "supplement_review"
+        ],
         "review_export": "review_export.json",
     }
     store.save_report(action_name, contact_pipeline, contact_report)
@@ -861,7 +1123,12 @@ def demo(output: str) -> None:
         ]
         for item in contact_v2.parameters["scheme_reviews"]
     }
-    print(f"contact evidence review schemes={scheme_verdicts}")
+    supplement_summary = contact_v5.parameters["supplement_review"]
+    print(
+        f"contact evidence review schemes={scheme_verdicts} "
+        f"supplement_supported={supplement_summary['supported_intervals']} "
+        f"supplement_conflicts={supplement_summary['conflicting_intervals']}"
+    )
 
 
 def main() -> None:

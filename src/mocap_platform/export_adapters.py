@@ -17,6 +17,8 @@ def build_review_export(
     candidates: list[Any] | None = None,
     schemes: list[Any] | None = None,
     object_tracks: dict[str, Any] | None = None,
+    supplement_batches: list[Any] | None = None,
+    supplement_adoptions: list[Any] | None = None,
 ) -> dict[str, Any]:
     impacts = {
         item["decision_id"]: item["status"]
@@ -31,6 +33,18 @@ def build_review_export(
         item["contact_id"]: item
         for item in contact_review.get("contact_results", [])
     }
+    frame_provenance: dict[str, dict[str, dict[str, Any]]] = {}
+    for contact_id, result in contact_results.items():
+        for used in result.get("observations_used", []):
+            frame_key = str(used["frame"])
+            frame_provenance.setdefault(contact_id, {})[frame_key] = {
+                "observed_marker": used["observed_marker"],
+                "distance": used["distance"],
+                "body_source": used.get("body_source", "raw_observation"),
+                "body_batch_id": used.get("body_batch_id"),
+                "object_source": used.get("object_source", "raw_observation"),
+                "object_batch_id": used.get("object_batch_id"),
+            }
     candidate_review = contact_review.get("claim_conflicts", [])
     conflicting_candidates = {
         candidate_id
@@ -129,4 +143,14 @@ def build_review_export(
         ],
         "contact_review": contact_review,
         "simultaneous_contacts": contact_review.get("simultaneous_contacts", []),
+        "supplement_batches": [
+            batch.to_dict() if hasattr(batch, "to_dict") else batch
+            for batch in (supplement_batches or [])
+        ],
+        "supplement_adoptions": [
+            adoption.to_dict() if hasattr(adoption, "to_dict") else adoption
+            for adoption in (supplement_adoptions or [])
+        ],
+        "supplement_review": contact_review.get("supplement_review", {}),
+        "frame_observation_provenance": frame_provenance,
     }

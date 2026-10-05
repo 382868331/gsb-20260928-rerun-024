@@ -9,6 +9,7 @@ from .contact import (
     disputed_contact_intervals,
     evaluate_contact_compatibility,
     object_missing_intervals,
+    resolve_supplement_points,
     schemes_dependent_on,
     unresolved_pose_intervals,
 )
@@ -552,6 +553,8 @@ def reconstruct(
     identity_candidates: list[Any] | None = None,
     contact_objects: dict[str, list[list[float] | None]] | None = None,
     identity_schemes: list[Any] | None = None,
+    supplement_batches: list[Any] | None = None,
+    supplement_adoptions: list[Any] | None = None,
     ambiguity_windows: list[dict[str, Any]] | None = None,
     based_on: ProcessingVersion | None = None,
 ) -> ProcessingVersion:
@@ -561,6 +564,8 @@ def reconstruct(
     identity_candidates = identity_candidates or []
     contact_objects = contact_objects or {}
     identity_schemes = identity_schemes or []
+    supplement_batches = supplement_batches or []
+    supplement_adoptions = supplement_adoptions or []
     applied_reassignments, reassignment_disputes, disputed_ids = resolve_reassignments(
         reassignments
     )
@@ -609,13 +614,25 @@ def reconstruct(
         for contact in contact_observations
         if getattr(contact, "status", "active") == "revoked"
     }
+    revoked_supplement_ids = {
+        batch.batch_id
+        for batch in supplement_batches
+        if getattr(batch, "status", "active") == "revoked"
+    }
+    supplement_index = resolve_supplement_points(
+        supplement_batches, supplement_adoptions
+    )
     contact_review = evaluate_contact_compatibility(
-        active_contacts, identity_candidates, observations, contact_objects
+        active_contacts,
+        identity_candidates,
+        observations,
+        contact_objects,
+        supplement_index=supplement_index,
     )
     contact_intervals = disputed_contact_intervals(contact_review)
     dependent_candidate_ids = candidates_dependent_on(
         identity_candidates,
-        revoked_contact_ids,
+        revoked_contact_ids | revoked_supplement_ids,
         {
             reassignment.reassignment_id
             for reassignment in reassignments
@@ -637,7 +654,11 @@ def reconstruct(
             if candidate.candidate_id in set(scheme.candidate_ids)
         ]
         scheme_contact_review = evaluate_contact_compatibility(
-            active_contacts, scheme_candidates, observations, contact_objects
+            active_contacts,
+            scheme_candidates,
+            observations,
+            contact_objects,
+            supplement_index=supplement_index,
         )
         scheme_contact_intervals = disputed_contact_intervals(scheme_contact_review)
         return {
@@ -664,6 +685,14 @@ def reconstruct(
                 if interval["end_frame"] >= scheme.crossing_start_frame
                 and interval["start_frame"] <= scheme.crossing_end_frame
             ],
+            "supplement_conflict_intervals": [
+                interval
+                for interval in scheme_contact_intervals[
+                    "supplement_conflict_intervals"
+                ]
+                if interval["end_frame"] >= scheme.crossing_start_frame
+                and interval["start_frame"] <= scheme.crossing_end_frame
+            ],
             "claim_conflict_intervals": scheme_contact_intervals[
                 "identity_claim_conflict_intervals"
             ],
@@ -679,6 +708,11 @@ def reconstruct(
         "contact_dependent_candidates": dependent_candidate_ids,
         "contact_dependent_schemes": dependent_scheme_ids,
         "scheme_reviews": scheme_reviews,
+        "supplement_batches": [batch.to_dict() for batch in supplement_batches],
+        "supplement_adoptions": [
+            adoption.to_dict() for adoption in supplement_adoptions
+        ],
+        "supplement_review": contact_review.get("supplement_review", {}),
     }
 
     contact_ranges = [

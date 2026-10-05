@@ -212,6 +212,152 @@ class ContactObservation:
 
 
 @dataclass
+class SupplementTrack:
+    """One supplemental trajectory handed in after the original review.
+
+    A track supplements either an object (``subject_kind == "object"`` and
+    ``subject_id`` equal to the object id) or a hand/body marker
+    (``subject_kind == "body"`` and ``subject_id`` equal to the observed
+    person-qualified marker). Positions align frame by frame with
+    ``start_frame``; a ``None`` entry keeps that frame missing instead of
+    inventing a position.
+    """
+
+    subject_id: str
+    subject_kind: Literal["object", "body"]
+    start_frame: int
+    points: list[Point3 | None]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subject_id": self.subject_id,
+            "subject_kind": self.subject_kind,
+            "start_frame": self.start_frame,
+            "points": self.points,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SupplementTrack":
+        return cls(
+            subject_id=data["subject_id"],
+            subject_kind=data["subject_kind"],
+            start_frame=data["start_frame"],
+            points=[
+                None if point is None else list(point)
+                for point in data["points"]
+            ],
+        )
+
+
+@dataclass
+class SupplementBatch:
+    """Immutable batch of supplemental trajectories for one object.
+
+    Batches are evidence only: adopting intervals never overwrites the raw
+    capture, object tracks or already confirmed manual contact decisions.
+    """
+
+    batch_id: str
+    object_id: str
+    tracks: list[SupplementTrack]
+    source: str
+    reason: str = ""
+    status: Literal["active", "revoked"] = "active"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "supplement_batch",
+            "version": 1,
+            "batch_id": self.batch_id,
+            "object_id": self.object_id,
+            "tracks": [track.to_dict() for track in self.tracks],
+            "source": self.source,
+            "reason": self.reason,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SupplementBatch":
+        return cls(
+            batch_id=data["batch_id"],
+            object_id=data["object_id"],
+            tracks=[
+                SupplementTrack.from_dict(track) for track in data["tracks"]
+            ],
+            source=data["source"],
+            reason=data.get("reason", ""),
+            status=data.get("status", "active"),
+            created_at=data.get("created_at", utc_now()),
+        )
+
+
+@dataclass
+class SupplementSelection:
+    """Reviewer-chosen interval of one track inside a supplement batch."""
+
+    subject_id: str
+    subject_kind: Literal["object", "body"]
+    start_frame: int
+    end_frame: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subject_id": self.subject_id,
+            "subject_kind": self.subject_kind,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+        }
+
+
+@dataclass
+class SupplementAdoption:
+    """Manual per-batch choice of which missing intervals adopt new material.
+
+    Selections may cover only part of a handed-in track (partial adoption).
+    Adoption is a manual choice layered on top of evidence; it never mutates
+    a confirmed manual contact annotation.
+    """
+
+    adoption_id: str
+    batch_id: str
+    object_id: str
+    selections: list[SupplementSelection] = field(default_factory=list)
+    reason: str = ""
+    status: Literal["applied", "revoked"] = "applied"
+    created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "supplement_adoption",
+            "version": 1,
+            "adoption_id": self.adoption_id,
+            "batch_id": self.batch_id,
+            "object_id": self.object_id,
+            "selections": [selection.to_dict() for selection in self.selections],
+            "reason": self.reason,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SupplementAdoption":
+        return cls(
+            adoption_id=data["adoption_id"],
+            batch_id=data["batch_id"],
+            object_id=data["object_id"],
+            selections=[
+                SupplementSelection(**selection)
+                for selection in data.get("selections", [])
+            ],
+            reason=data.get("reason", ""),
+            status=data.get("status", "applied"),
+            created_at=data.get("created_at", utc_now()),
+        )
+
+
+@dataclass
 class IdentityCandidate:
     """One identity interpretation of a body trajectory inside a crossing.
 
