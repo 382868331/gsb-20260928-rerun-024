@@ -352,6 +352,15 @@ def evaluate_supplementary_batches(
     verdict even when a batch contradicts it.  Adopting the same frame from
     two batches does not double-count evidence; genuinely conflicting
     adopted batches are listed side by side.
+
+    Each frame is evaluated by combining the valid raw observations with the
+    explicitly adopted supplement tracks: a batch that only remeasures the
+    object still resolves a frame whose hand position is already observed in
+    the raw capture, and a hand-only batch completes a frame whose object
+    position is on record.  Only frames that still lack any required
+    position remain unexplained.  When adopted batches disagree on the same
+    frame, every source is kept next to the unresolved conclusion instead of
+    letting arrival order decide.
     """
     active_contacts = [
         contact
@@ -374,6 +383,17 @@ def evaluate_supplementary_batches(
         for candidate in candidates
         if getattr(candidate, "decision", "open") == "adopted"
     }
+
+    def raw_body_point(body_marker: str, frame_index: int) -> list[float] | None:
+        if frame_index >= len(raw_observations):
+            return None
+        return raw_observations[frame_index].get(body_marker)
+
+    def raw_object_point(object_id: str, frame_index: int) -> list[float] | None:
+        track = objects.get(object_id, [])
+        if frame_index < 0 or frame_index >= len(track):
+            return None
+        return track[frame_index]
 
     # frame_claims[(contact_id, frame)] lists per-batch adopted verdicts so
     # duplicates and side-by-side conflicts can be derived afterwards.
@@ -418,10 +438,22 @@ def evaluate_supplementary_batches(
             contact_pending: list[int] = []
             contact_missing: list[int] = []
             for frame_index in missing_by_contact.get(contact.contact_id, []):
-                object_point = _track_point(object_track, frame_index)
-                body_point = _track_point(body_track, frame_index)
+                raw_body = raw_body_point(body_marker, frame_index)
+                raw_object = raw_object_point(contact.object_id, frame_index)
+                batch_body = _track_point(body_track, frame_index)
+                batch_object = _track_point(object_track, frame_index)
+                # Combine the raw capture with this batch: whichever side
+                # actually holds a position supplies it.
+                body_point = raw_body if raw_body is not None else batch_body
+                object_point = raw_object if raw_object is not None else batch_object
+                contributes = (
+                    raw_body is None and batch_body is not None
+                ) or (raw_object is None and batch_object is not None)
                 if object_point is None or body_point is None:
-                    contact_missing.append(frame_index)
+                    if contributes:
+                        # The batch covers part of the gap but a required
+                        # position is still unavailable from any source.
+                        contact_missing.append(frame_index)
                     continue
                 if not _intervals_contain(adopted_intervals, frame_index):
                     contact_pending.append(frame_index)
@@ -443,6 +475,12 @@ def evaluate_supplementary_batches(
                         "object_id": contact.object_id,
                         "object_target": OBJECT_TARGET,
                         "body_target": body_marker,
+                        "object_source": (
+                            "raw_observation" if raw_object is not None else "supplement"
+                        ),
+                        "body_source": (
+                            "raw_observation" if raw_body is not None else "supplement"
+                        ),
                         "distance": gap,
                         "verdict": verdict,
                         "source": batch.source,
@@ -496,6 +534,160 @@ def evaluate_supplementary_batches(
             }
         )
 
+    # Combined view: per frame, merge the raw observations with every
+    # adopted supplement (across batches).  A frame resolves only when each
+    # required position is available and the adopted sources agree; batches
+    # that disagree keep the frame contested with all sources preserved.
+    active_batches = [
+        batch
+        for batch in batches
+        if getattr(batch, "status", "pending") != "withdrawn"
+    ]
+
+    def _contested(sources: list[dict[str, Any]]) -> bool:
+        positions = [source["position"] for source in sources]
+        return any(
+            _distance(first, second) > tolerance
+            for index, first in enumerate(positions)
+            for second in positions[index + 1 :]
+        )
+
+    combined_results: list[dict[str, Any]] = []
+    for contact in active_contacts:
+        candidate = candidate_for_contact(candidates, contact)
+        body_marker = interpreted_body_marker(candidate, contact)
+        contact_frames: list[dict[str, Any]] = []
+        for frame_index in missing_by_contact.get(contact.contact_id, []):
+            raw_body = raw_body_point(body_marker, frame_index)
+            raw_object = raw_object_point(contact.object_id, frame_index)
+            body_sources: list[dict[str, Any]] = []
+            object_sources: list[dict[str, Any]] = []
+            if raw_body is not None:
+                body_sources.append(
+                    {"source": "raw_observation", "position": raw_body}
+                )
+            if raw_object is not None:
+                object_sources.append(
+                    {"source": "raw_observation", "position": raw_object}
+                )
+            for batch in active_batches:
+                if contact.object_id != batch.object_id:
+                    continue
+                if not _intervals_contain(
+                    getattr(batch, "adopted_intervals", []), frame_index
+                ):
+                    continue
+                batch_body = _track_point(batch.tracks.get(body_marker), frame_index)
+                batch_object = _track_point(
+                    batch.tracks.get(OBJECT_TARGET), frame_index
+                )
+                if raw_body is None and batch_body is not None:
+                    body_sources.append(
+                        {"source": batch.batch_id, "position": batch_body}
+                    )
+                if raw_object is None and batch_object is not None:
+                    object_sources.append(
+                        {"source": batch.batch_id, "position": batch_object}
+                    )
+            entry: dict[str, Any] = {
+                "frame": frame_index,
+                "contact_id": contact.contact_id,
+                "body_sources": body_sources,
+                "object_sources": object_sources,
+            }
+            if not body_sources or not object_sources:
+                # Not resolved by adopted evidence; a frame stays pending
+                # only while some batch could still fill the gap, and is
+                # still missing when no source can provide the position.
+                body_completable = bool(body_sources) or any(
+                    _track_point(batch.tracks.get(body_marker), frame_index)
+                    is not None
+                    for batch in active_batches
+                    if contact.object_id == batch.object_id
+                )
+                object_completable = bool(object_sources) or any(
+                    _track_point(batch.tracks.get(OBJECT_TARGET), frame_index)
+                    is not None
+                    for batch in active_batches
+                    if contact.object_id == batch.object_id
+                )
+                entry["status"] = (
+                    "pending"
+                    if body_completable and object_completable
+                    else "still_missing"
+                )
+            elif _contested(body_sources) or _contested(object_sources):
+                entry["status"] = "contested"
+            else:
+                gap = _distance(
+                    body_sources[0]["position"], object_sources[0]["position"]
+                )
+                entry["distance"] = gap
+                entry["status"] = (
+                    "supported" if gap <= tolerance else "contradicting"
+                )
+            contact_frames.append(entry)
+        if contact_frames:
+            combined_results.append(
+                {
+                    "contact_id": contact.contact_id,
+                    "object_id": contact.object_id,
+                    "observed_marker": body_marker,
+                    "frames": contact_frames,
+                }
+            )
+
+    combined_frames = [
+        entry for result in combined_results for entry in result["frames"]
+    ]
+
+    # A frame the combined evidence already resolves is not reported as
+    # still missing by any single batch, even if that batch alone only
+    # covers part of the gap.
+    combined_status = {
+        (result["contact_id"], entry["frame"]): entry["status"]
+        for result in combined_results
+        for entry in result["frames"]
+    }
+    for batch_result in batch_results:
+        kept_contacts: list[dict[str, Any]] = []
+        for contact_result in batch_result["contacts"]:
+            contact_result["still_missing_frames"] = [
+                frame
+                for frame in contact_result["still_missing_frames"]
+                if combined_status.get((contact_result["contact_id"], frame))
+                not in {"supported", "contradicting"}
+            ]
+            if not (
+                contact_result["supported_frames"]
+                or contact_result["contradicting_frames"]
+                or contact_result["pending_frames"]
+                or contact_result["still_missing_frames"]
+            ):
+                continue
+            kept_contacts.append(contact_result)
+        batch_result["contacts"] = kept_contacts
+        batch_result["supported_frames"] = sorted(
+            {frame for item in kept_contacts for frame in item["supported_frames"]}
+        )
+        batch_result["contradicting_frames"] = sorted(
+            {
+                item["frame"]
+                for contact in kept_contacts
+                for item in contact["contradicting_frames"]
+            }
+        )
+        batch_result["pending_frames"] = sorted(
+            {frame for item in kept_contacts for frame in item["pending_frames"]}
+        )
+        batch_result["still_missing_frames"] = sorted(
+            {
+                frame
+                for item in kept_contacts
+                for frame in item["still_missing_frames"]
+            }
+        )
+
     duplicate_adoptions: list[dict[str, Any]] = []
     conflicting_supplements: list[dict[str, Any]] = []
     for (contact_id, frame_index), claims in sorted(frame_claims.items()):
@@ -521,27 +713,42 @@ def evaluate_supplementary_batches(
     return {
         "tolerance": tolerance,
         "batch_results": batch_results,
+        "combined_results": combined_results,
         "duplicate_adoptions": duplicate_adoptions,
         "conflicting_supplements": conflicting_supplements,
         "supported_intervals": _merge_intervals(
             [
-                (frame, frame)
-                for result in batch_results
-                for frame in result["supported_frames"]
+                (entry["frame"], entry["frame"])
+                for entry in combined_frames
+                if entry["status"] == "supported"
             ]
         ),
         "contradicting_intervals": _merge_intervals(
             [
-                (frame, frame)
-                for result in batch_results
-                for frame in result["contradicting_frames"]
+                (entry["frame"], entry["frame"])
+                for entry in combined_frames
+                if entry["status"] == "contradicting"
+            ]
+        ),
+        "pending_intervals": _merge_intervals(
+            [
+                (entry["frame"], entry["frame"])
+                for entry in combined_frames
+                if entry["status"] == "pending"
+            ]
+        ),
+        "contested_intervals": _merge_intervals(
+            [
+                (entry["frame"], entry["frame"])
+                for entry in combined_frames
+                if entry["status"] == "contested"
             ]
         ),
         "still_missing_intervals": _merge_intervals(
             [
-                (frame, frame)
-                for result in batch_results
-                for frame in result["still_missing_frames"]
+                (entry["frame"], entry["frame"])
+                for entry in combined_frames
+                if entry["status"] == "still_missing"
             ]
         ),
     }

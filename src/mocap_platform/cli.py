@@ -670,12 +670,23 @@ def demo(output: str) -> None:
         source="manual_review_clip",
         reason="short occlusion clip suggests contact but the hand marker is absent",
     )
+    occluded_ankle_contact = ContactObservation(
+        contact_id="contact_006_p0_ankle_near_ball_occluded",
+        person_id="p0",
+        body_part="r_ankle",
+        object_id="ball_01",
+        start_frame=27,
+        end_frame=28,
+        source="manual_review_clip",
+        reason="occluded ankle clip suggests a foot touch; the ankle marker is absent",
+    )
     for contact in (
         crossing_contact_p0,
         crossing_contact_p1,
         post_separation_contact,
         automatic_hint,
         short_occlusion_contact,
+        occluded_ankle_contact,
     ):
         store.save_contact(action_name, contact_pipeline, contact)
 
@@ -756,6 +767,7 @@ def demo(output: str) -> None:
             post_separation_contact,
             automatic_hint,
             short_occlusion_contact,
+            occluded_ankle_contact,
         ],
         identity_candidates=[candidate_swap, candidate_no_swap, candidate_double_claim],
         contact_objects=contact_objects,
@@ -796,6 +808,7 @@ def demo(output: str) -> None:
             post_separation_contact,
             automatic_hint,
             short_occlusion_contact,
+            occluded_ankle_contact,
         ],
         identity_candidates=adopted_candidates,
         contact_objects=contact_objects,
@@ -864,45 +877,28 @@ def demo(output: str) -> None:
     }
     print(f"contact evidence review schemes={scheme_verdicts}")
 
-    # Supplementary observation batches: two people touch the same ball, and
-    # reviewers remeasure the object and both hands with tracks of different
-    # lengths that only partially overlap.  Batches are saved as pending
-    # evidence; nothing is adopted yet and old versions keep their gaps.
-    def true_ball_position(frame_index: int) -> list[float]:
-        point = scoped_truth[frame_index]["p0_l_wrist"]
-        if 20 <= frame_index <= 24:
-            other = scoped_truth[frame_index]["p1_r_wrist"]
-            return [(point[axis] + other[axis]) / 2 for axis in range(3)]
-        return list(point)
-
+    # Supplementary observation batches: reviewers remeasure only part of the
+    # gap per batch -- one batch carries only the object, another only an
+    # occluded ankle -- while the raw capture already holds the hand tracks.
+    # Batches are saved as pending evidence; nothing is adopted yet and old
+    # versions keep their gaps.
     def offset(point: list[float], amount: float) -> list[float]:
         return [point[0] + amount, point[1], point[2]]
 
-    supplement_primary = SupplementaryBatch(
-        batch_id="supplement_001_two_hand_remeasure",
+    supplement_object_only = SupplementaryBatch(
+        batch_id="supplement_001_object_only_remeasure",
         object_id="ball_01",
         tracks={
             "object": {
                 "start_frame": 22,
-                "positions": [true_ball_position(index) for index in range(22, 29)],
-            },
-            "p1_r_wrist": {
-                "start_frame": 21,
-                "positions": [
-                    offset(true_ball_position(index), 0.05)
-                    for index in range(21, 27)
-                ],
-            },
-            "p0_l_wrist": {
-                "start_frame": 25,
                 "positions": [
                     list(scoped_truth[index]["p0_l_wrist"])
-                    for index in range(25, 30)
+                    for index in range(22, 29)
                 ],
             },
         },
         source="manual_remeasure_session_a",
-        reason="remeasured the ball and both hands during the grasp gap",
+        reason="remeasured only the ball during the grasp gap",
     )
     supplement_conflicting = SupplementaryBatch(
         batch_id="supplement_002_conflicting_remeasure",
@@ -911,22 +907,31 @@ def demo(output: str) -> None:
             "object": {
                 "start_frame": 22,
                 "positions": [
-                    offset(true_ball_position(index), 0.6)
+                    offset(list(scoped_truth[index]["p0_l_wrist"]), 0.6)
                     for index in range(22, 30)
-                ],
-            },
-            "p1_r_wrist": {
-                "start_frame": 22,
-                "positions": [
-                    offset(true_ball_position(index), 0.05)
-                    for index in range(22, 25)
                 ],
             },
         },
         source="manual_remeasure_session_b",
         reason="second remeasure session disagrees on the ball position",
     )
-    for batch in (supplement_primary, supplement_conflicting):
+    supplement_ankle_only = SupplementaryBatch(
+        batch_id="supplement_003_ankle_only_remeasure",
+        object_id="ball_01",
+        tracks={
+            "p0_r_ankle": {
+                "start_frame": 27,
+                "positions": [list(scoped_truth[27]["p0_r_ankle"])],
+            },
+        },
+        source="manual_remeasure_session_c",
+        reason="remeasured only the occluded ankle for one frame",
+    )
+    for batch in (
+        supplement_object_only,
+        supplement_conflicting,
+        supplement_ankle_only,
+    ):
         store.save_supplement(action_name, contact_pipeline, batch)
 
     supplement_candidate = IdentityCandidate(
@@ -980,9 +985,9 @@ def demo(output: str) -> None:
     store.adopt_supplement(
         action_name,
         contact_pipeline,
-        supplement_primary.batch_id,
+        supplement_object_only.batch_id,
         intervals=[{"start_frame": 22, "end_frame": 23}],
-        reason="adopt the two-hand grasp remeasure for the occluded frames",
+        reason="adopt the object remeasure for the occluded grasp frames",
     )
     store.adopt_supplement(
         action_name,
@@ -990,6 +995,13 @@ def demo(output: str) -> None:
         supplement_conflicting.batch_id,
         intervals=[{"start_frame": 22, "end_frame": 23}],
         reason="adopt the second session for side-by-side comparison",
+    )
+    store.adopt_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_ankle_only.batch_id,
+        intervals=[{"start_frame": 27, "end_frame": 27}],
+        reason="adopt the ankle remeasure for the occluded foot contact",
     )
     adopted_batches = [
         SupplementaryBatch(**data)
@@ -1011,28 +1023,17 @@ def demo(output: str) -> None:
     )
     store.save_processing(contact_v5)
 
-    contact_export = build_review_export(
-        store.load_capture(contact_capture_id),
-        contact_v5.to_dict(),
-        [],
-        [],
-        contacts=reloaded_contacts,
-        candidates=all_contact_candidates,
-        schemes=all_contact_schemes,
-        object_tracks=store.load_object_tracks(action_name, contact_pipeline),
-        supplements=adopted_batches,
-    )
-    store.save_review_export(action_name, contact_pipeline, contact_export)
-
-    # Withdrawing one batch only rechecks the interpretations that depend
-    # on it; the adopted intervals of the other batch remain in place.
-    store.withdraw_supplement(
+    # A second adoption on the same batch appends another interval: the
+    # object-only remeasure now also covers frame 27, where the raw capture
+    # already holds the carrying hand.
+    store.adopt_supplement(
         action_name,
         contact_pipeline,
-        supplement_conflicting.batch_id,
-        reason="second remeasure session retracted by its operator",
+        supplement_object_only.batch_id,
+        intervals=[{"start_frame": 27, "end_frame": 27}],
+        reason="extend the object remeasure to the remaining missing frame",
     )
-    remaining_batches = [
+    extended_batches = [
         SupplementaryBatch(**data)
         for data in store.load_supplements(action_name, contact_pipeline)
     ]
@@ -1046,22 +1047,73 @@ def demo(output: str) -> None:
         identity_candidates=all_contact_candidates,
         contact_objects=contact_objects,
         identity_schemes=all_contact_schemes,
-        supplementary_batches=remaining_batches,
+        supplementary_batches=extended_batches,
         ambiguity_windows=scoped_windows,
         based_on=contact_v5,
     )
     store.save_processing(contact_v6)
-    contact_report["supplement_review"] = contact_v5.parameters["supplement_review"]
-    contact_report["supplement_dependent_candidates"] = contact_v6.parameters[
+
+    # Withdrawing one batch only rechecks the interpretations that depend on
+    # it; a partial withdrawal removes just the appended interval while the
+    # earlier adoption stays in place.  The final version is rebuilt from
+    # what load_supplements reads back from disk.
+    store.withdraw_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_conflicting.batch_id,
+        reason="second remeasure session retracted by its operator",
+    )
+    store.withdraw_supplement(
+        action_name,
+        contact_pipeline,
+        supplement_object_only.batch_id,
+        intervals=[{"start_frame": 27, "end_frame": 27}],
+        reason="reviewer keeps only the grasp-frame object remeasure",
+    )
+    remaining_batches = [
+        SupplementaryBatch(**data)
+        for data in store.load_supplements(action_name, contact_pipeline)
+    ]
+    contact_v7 = reconstruct(
+        action_name,
+        contact_pipeline,
+        contact_capture_id,
+        scoped_observed,
+        scoped_calibration_dict,
+        contact_observations=reloaded_contacts,
+        identity_candidates=all_contact_candidates,
+        contact_objects=contact_objects,
+        identity_schemes=all_contact_schemes,
+        supplementary_batches=remaining_batches,
+        ambiguity_windows=scoped_windows,
+        based_on=contact_v6,
+    )
+    store.save_processing(contact_v7)
+
+    contact_export = build_review_export(
+        store.load_capture(contact_capture_id),
+        contact_v7.to_dict(),
+        [],
+        [],
+        contacts=reloaded_contacts,
+        candidates=all_contact_candidates,
+        schemes=all_contact_schemes,
+        object_tracks=store.load_object_tracks(action_name, contact_pipeline),
+        supplements=remaining_batches,
+    )
+    store.save_review_export(action_name, contact_pipeline, contact_export)
+
+    contact_report["supplement_review"] = contact_v7.parameters["supplement_review"]
+    contact_report["supplement_dependent_candidates"] = contact_v7.parameters[
         "supplement_dependent_candidates"
     ]
-    contact_report["supplement_dependent_schemes"] = contact_v6.parameters[
+    contact_report["supplement_dependent_schemes"] = contact_v7.parameters[
         "supplement_dependent_schemes"
     ]
     store.save_report(action_name, contact_pipeline, contact_report)
     supplement_status = {
         item["batch_id"]: item["status"]
-        for item in contact_v6.parameters["supplement_review"]["batch_results"]
+        for item in contact_v7.parameters["supplement_review"]["batch_results"]
     }
     print(f"supplement review statuses={supplement_status}")
 

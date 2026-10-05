@@ -26,10 +26,11 @@
 
 ## 接触缺测补测批
 
-已有接触缺失范围可以补交分批观测（`SupplementaryBatch`，保存在 `processing/<action>/<pipeline>/supplements/`）：同一物体可补交多批，每批为物体和两只手分别携带长短不同、部分重叠的轨迹。补测批写入后不可变，初始为 `pending`；用户用 `adopt_supplement` 按缺失区间逐段采用（可多次追加，状态变为 `partially_adopted`），用 `withdraw_supplement` 追加独立撤回记录。
+已有接触缺失范围可以补交分批观测（`SupplementaryBatch`，保存在 `processing/<action>/<pipeline>/supplements/`）：同一物体可补交多批，每批为物体和两只手分别携带长短不同、部分重叠的轨迹，也可以只补物体或只补一只手。补测批写入后不可变，初始为 `pending`；用户用 `adopt_supplement` 按缺失区间逐段采用（可多次追加，状态变为 `partially_adopted`），用 `withdraw_supplement` 追加独立撤回记录（整批撤回或按区间部分撤回）。
 
-- 补测只作为复核证据：旧处理版本保留当时可见的观测与缺口，补测结果不回写 `contact_review` 的判定；已采纳候选对应的人工接触决定标记 `protected_by_confirmed_decision`，即使补测矛盾也不改写。
-- 冲突补测并列展示：`supplement_review` 逐批给出支持（`supported_frames`）、矛盾（`contradicting_frames`）、未采用（`pending_frames`）与仍缺失（`still_missing_frames`）范围；两批对同一帧结论相反时写入 `conflicting_supplements` 并列对照。
+- 补测只作为复核证据：旧处理版本保留当时可见的观测与缺口，补测结果不回写 `contact_review` 的判定；已采纳候选对应的人工接触决定标记 `protected_by_confirmed_decision`，即使补测矛盾也不改写。原始轨迹与已确认人工接触永远不会被补测改写。
+- 逐帧结合原始观测与明确采用的补测：批只补物体而手部已有原始观测（或反之）时该帧即可判定，只有仍缺少任一必需位置的帧才保留为待解释；`combined_results` 逐帧记录每个位置的来源（`raw_observation` 或具体批次），跨批互补（如一批补物体、另一批补脚踝）同样逐帧合并判定。
+- 冲突补测并列展示：`supplement_review` 逐批给出支持（`supported_frames`）、矛盾（`contradicting_frames`）、未采用（`pending_frames`）与仍缺失（`still_missing_frames`）范围；两批对同一帧结论相反时写入 `conflicting_supplements` 并列对照，来源与未决结论都保留，不按到达顺序覆盖；全局区间另给出 `supported_intervals`、`contradicting_intervals`、`pending_intervals`、`contested_intervals` 与 `still_missing_intervals`，与实际可用事实一致。
 - 重复采用不增加证据：同一帧被多批采用时记入 `duplicate_adoptions`，证据只计一次。
 - 撤回一批补测只影响依赖它的解释：`supplement_dependent_candidates` 与 `supplement_dependent_schemes` 逐条列出需重检的候选与方案，其他批次已采用的区间保持不变。
 - 未决补测保存后可重开（`load_supplements`）再局部采用；导出的 `review_export.json` 中 `supplementary_batches[].frame_evidence` 逐帧记录使用了哪一批的哪条轨迹、距离与人工采用区间，可完整追溯。
@@ -52,7 +53,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 7. 生成限定范围复核场景（手臂交叉 + 右踝短时交换 + 局部遮挡 + 重现歧义）：v001 基线；v002 仅确认右踝 25–29 帧，左腕与其他时段歧义保留；v003 追加相邻区间（20–24 帧）左臂确认，两个决定窗口分别记录；v004 引入冲突的否定决定，逐条记录且不应用；v005 撤销踝部确认并演示从磁盘重载决定后继续核对，被撤窗口的歧义重新出现。
 8. 生成轨迹改归复核场景：v001 基线；v002 确认左臂 20–24 帧；v003 提出把 `p1` 右臂轨迹 20–29 帧改归为 `p0` 左臂，仅展示关联变化预览；v004 应用改归并保留既有确认；v005 追加依赖该改归的右踝确认；v006 另一人重复采用同一腕部轨迹，标记为争议且不应用；v007 从磁盘重载后撤销两条改归，依赖它的踝部确认重新进入待处理，左臂确认与其他时段保持原样，并导出 `review_export.json`。
 9. 生成接触证据复核场景：v001 保存移动球、短时物体缺口、交叉接触、共同抓握、接触后分离、短时遮挡和自动邻近推荐；v002 独立比较换位/保持标签两种方案及一个重复认领方案，采纳相容候选并排除几何冲突候选；v003 撤回一条人工接触后只重检依赖它的候选和方案，并导出包含原观测、人工接触说明、候选状态与理由的 `review_export.json`。
-10. 生成接触缺测补测场景：v004 保存两批未决补测（物体与两只手长短不同、部分重叠的轨迹，第二批与第一批矛盾）；v005 重开后两批各局部采用 22–23 帧，并列展示支持/矛盾/仍缺失（27 帧）范围、重复采用去重与冲突对照，并导出含逐帧补测证据的 `review_export.json`；v006 撤回第二批补测，仅依赖它的候选与方案进入重检。
+10. 生成接触缺测补测场景：v004 保存三批未决补测（第一批只补物体、第二批只补物体但与第一批矛盾、第三批只补一只被遮挡的脚踝）；v005 重开后各批局部采用，只补物体的批次结合手部原始观测判定 22–23 帧，冲突批并列对照、重复采用去重；v006 对第一批追加采用 27 帧，跨批合并（物体批 + 脚踝批）判定脚部接触；v007 整批撤回第二批并部分撤回第一批的 27 帧，仅依赖撤回批的候选与方案进入重检，被撤区间回到待解释，并导出含逐帧补测证据与来源的 `review_export.json`。
 
 主要结果在：
 
@@ -70,7 +71,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 - `data/processing/demo_multi_person_action/trajectory_reassignment_review/evaluation_report.json`
 - `data/processing/demo_multi_person_action/contact_evidence_review/versions/v00{1,2,3}/reconstruction.json`
 - `data/processing/demo_multi_person_action/contact_evidence_review/{contacts,objects,candidates,schemes,supplements}/`
-- `data/processing/demo_multi_person_action/contact_evidence_review/versions/v00{4,5,6}/reconstruction.json`
+- `data/processing/demo_multi_person_action/contact_evidence_review/versions/v00{4,5,6,7}/reconstruction.json`
 - `data/processing/demo_multi_person_action/contact_evidence_review/review_export.json`
 - `data/processing/demo_multi_person_action/contact_evidence_review/evaluation_report.json`
 

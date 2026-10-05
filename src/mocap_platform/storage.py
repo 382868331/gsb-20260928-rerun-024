@@ -303,19 +303,35 @@ class PlatformStore:
         pipeline_name: str,
         batch_id: str,
         reason: str = "",
+        intervals: list[dict[str, int]] | None = None,
     ) -> Path:
         directory = self.supplements_dir(action_name, pipeline_name)
         base_path = directory / f"{batch_id}.json"
         if not base_path.exists():
             raise FileNotFoundError(f"cannot withdraw unknown supplement: {base_path}")
-        path = directory / f"{batch_id}.withdrawal.json"
-        if path.exists():
-            raise FileExistsError(f"supplement already withdrawn: {path}")
+        whole_path = directory / f"{batch_id}.withdrawal.json"
+        if whole_path.exists():
+            raise FileExistsError(f"supplement already withdrawn: {whole_path}")
+        if intervals is None:
+            atomic_write_json(
+                whole_path,
+                {
+                    "kind": "supplement_withdrawal",
+                    "batch_id": batch_id,
+                    "intervals": None,
+                    "reason": reason,
+                    "withdrawn_at": utc_now(),
+                },
+            )
+            return whole_path
+        existing = sorted(directory.glob(f"{batch_id}.withdrawal.*.json"))
+        path = directory / f"{batch_id}.withdrawal.{len(existing) + 1:03d}.json"
         atomic_write_json(
             path,
             {
                 "kind": "supplement_withdrawal",
                 "batch_id": batch_id,
+                "intervals": intervals,
                 "reason": reason,
                 "withdrawn_at": utc_now(),
             },
@@ -332,21 +348,52 @@ class PlatformStore:
             path.name[: -len(".withdrawal.json")]
             for path in directory.glob("*.withdrawal.json")
         }
+        partial_withdrawals: dict[str, list[dict[str, Any]]] = {}
+        for path in sorted(directory.glob("*.withdrawal.*.json")):
+            record = read_json(path)
+            partial_withdrawals.setdefault(record["batch_id"], []).append(record)
         adoptions: dict[str, list[dict[str, Any]]] = {}
         for path in sorted(directory.glob("*.adoption.*.json")):
             record = read_json(path)
             adoptions.setdefault(record["batch_id"], []).append(record)
+
+        def _frames(intervals: list[dict[str, int]]) -> set[int]:
+            return {
+                frame
+                for interval in intervals
+                for frame in range(interval["start_frame"], interval["end_frame"] + 1)
+            }
+
+        def _merged(frames: set[int]) -> list[dict[str, int]]:
+            merged: list[dict[str, int]] = []
+            for frame in sorted(frames):
+                if merged and frame == merged[-1]["end_frame"] + 1:
+                    merged[-1]["end_frame"] = frame
+                else:
+                    merged.append({"start_frame": frame, "end_frame": frame})
+            return merged
+
         batches: list[dict[str, Any]] = []
         for path in sorted(directory.glob("*.json")):
-            if ".adoption." in path.name or path.name.endswith(".withdrawal.json"):
+            if ".adoption." in path.name or ".withdrawal" in path.name:
                 continue
             data = read_json(path)
             batch_id = data["batch_id"]
-            intervals = [
-                interval
-                for record in adoptions.get(batch_id, [])
-                for interval in record["intervals"]
-            ]
+            adopted_frames = _frames(
+                [
+                    interval
+                    for record in adoptions.get(batch_id, [])
+                    for interval in record["intervals"]
+                ]
+            )
+            revoked_frames = _frames(
+                [
+                    interval
+                    for record in partial_withdrawals.get(batch_id, [])
+                    for interval in record.get("intervals") or []
+                ]
+            )
+            intervals = _merged(adopted_frames - revoked_frames)
             data["adopted_intervals"] = intervals
             if batch_id in withdrawn:
                 data["status"] = "withdrawn"

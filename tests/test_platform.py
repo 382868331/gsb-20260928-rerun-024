@@ -878,36 +878,80 @@ class PlatformIntegrationTest(unittest.TestCase):
             v4 = load("v004")["parameters"]["supplement_review"]
             v5 = load("v005")["parameters"]
             v6 = load("v006")["parameters"]
+            v7 = load("v007")["parameters"]
 
-            # Pending batches leave every missing frame untouched.
+            # Pending batches leave every missing frame untouched.  The
+            # object-only batch already pairs each gap frame with the raw
+            # hand observation, so those frames wait as pending instead of
+            # being misreported as missing.
             pending = {item["batch_id"]: item for item in v4["batch_results"]}
-            primary_pending = pending["supplement_001_two_hand_remeasure"]
-            self.assertEqual(primary_pending["status"], "pending")
-            self.assertEqual(primary_pending["pending_frames"], [22, 23])
-            self.assertEqual(primary_pending["still_missing_frames"], [27])
-            self.assertEqual(primary_pending["supported_frames"], [])
+            object_only_pending = pending["supplement_001_object_only_remeasure"]
+            self.assertEqual(object_only_pending["status"], "pending")
+            self.assertEqual(object_only_pending["pending_frames"], [22, 23, 27])
+            self.assertEqual(object_only_pending["still_missing_frames"], [27])
+            self.assertEqual(object_only_pending["supported_frames"], [])
+            self.assertEqual(
+                v4["pending_intervals"],
+                [
+                    {"start_frame": 22, "end_frame": 23},
+                    {"start_frame": 27, "end_frame": 27},
+                ],
+            )
+            self.assertEqual(
+                v4["still_missing_intervals"],
+                [{"start_frame": 28, "end_frame": 28}],
+            )
 
-            # Partial adoption: supporting, contradicting and still-missing
-            # ranges are listed side by side per batch.
+            # Partial adoption: the object-only batch resolves the occluded
+            # grasp frames against the raw hand track; the conflicting batch
+            # contradicts the same frames and both stay listed side by side.
             review = v5["supplement_review"]
             batches = {item["batch_id"]: item for item in review["batch_results"]}
-            primary = batches["supplement_001_two_hand_remeasure"]
+            object_only = batches["supplement_001_object_only_remeasure"]
             conflicting = batches["supplement_002_conflicting_remeasure"]
-            self.assertEqual(primary["status"], "partially_adopted")
-            self.assertEqual(primary["supported_frames"], [22, 23])
+            ankle_only = batches["supplement_003_ankle_only_remeasure"]
+            self.assertEqual(object_only["status"], "partially_adopted")
+            self.assertEqual(object_only["supported_frames"], [22, 23])
             self.assertEqual(conflicting["contradicting_frames"], [22, 23])
-            self.assertEqual(primary["still_missing_frames"], [27])
+            self.assertEqual(ankle_only["still_missing_frames"], [27])
+            self.assertEqual(
+                review["contested_intervals"],
+                [{"start_frame": 22, "end_frame": 23}],
+            )
+            self.assertEqual(
+                review["pending_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
             self.assertEqual(
                 review["still_missing_intervals"],
-                [{"start_frame": 27, "end_frame": 27}],
+                [{"start_frame": 28, "end_frame": 28}],
+            )
+            # The supporting evidence combines the adopted object track
+            # with the raw hand observation; neither side is rewritten.
+            grasp_evidence = [
+                item
+                for item in object_only["observations_used"]
+                if item["contact_id"]
+                == "contact_005_p1_hand_behind_ball_short_occlusion"
+            ]
+            self.assertEqual([item["frame"] for item in grasp_evidence], [22, 23])
+            self.assertTrue(
+                all(
+                    item["body_source"] == "raw_observation"
+                    for item in grasp_evidence
+                )
+            )
+            self.assertTrue(
+                all(item["object_source"] == "supplement" for item in grasp_evidence)
             )
 
             # The confirmed manual contact decision is protected: the
             # supplementary batch cannot rewrite it.
-            protected = primary["contacts"][0]
-            self.assertEqual(
-                protected["contact_id"],
-                "contact_001_p0_left_hand_ball_during_crossing",
+            protected = next(
+                item
+                for item in object_only["contacts"]
+                if item["contact_id"]
+                == "contact_001_p0_left_hand_ball_during_crossing"
             )
             self.assertTrue(protected["protected_by_confirmed_decision"])
             contact_results = {
@@ -939,27 +983,69 @@ class PlatformIntegrationTest(unittest.TestCase):
                 for item in conflicts
                 for claim in item["claims"]
             }
-            self.assertIn(("supplement_001_two_hand_remeasure", "supported"), verdicts)
+            self.assertIn(("supplement_001_object_only_remeasure", "supported"), verdicts)
             self.assertIn(
                 ("supplement_002_conflicting_remeasure", "contradicting"), verdicts
             )
 
-            # Withdrawing one batch rechecks only dependent interpretations.
+            # A second adoption extends the object-only batch to frame 27:
+            # the raw carrying hand plus the adopted object resolve the
+            # crossing contact, while the ankle-only batch combines with the
+            # object batch to contradict the occluded foot contact.
+            review6 = v6["supplement_review"]
             self.assertEqual(
-                v6["supplement_dependent_candidates"],
+                review6["supported_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            self.assertEqual(
+                review6["contradicting_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            combined6 = {
+                (result["contact_id"], entry["frame"]): entry
+                for result in review6["combined_results"]
+                for entry in result["frames"]
+            }
+            crossing_frame = combined6[
+                ("contact_001_p0_left_hand_ball_during_crossing", 27)
+            ]
+            self.assertEqual(crossing_frame["status"], "supported")
+            self.assertEqual(
+                [source["source"] for source in crossing_frame["body_sources"]],
+                ["raw_observation"],
+            )
+            self.assertEqual(
+                [source["source"] for source in crossing_frame["object_sources"]],
+                ["supplement_001_object_only_remeasure"],
+            )
+            ankle_frame = combined6[("contact_006_p0_ankle_near_ball_occluded", 27)]
+            self.assertEqual(ankle_frame["status"], "contradicting")
+            self.assertEqual(
+                [source["source"] for source in ankle_frame["body_sources"]],
+                ["supplement_003_ankle_only_remeasure"],
+            )
+            self.assertEqual(
+                [source["source"] for source in ankle_frame["object_sources"]],
+                ["supplement_001_object_only_remeasure"],
+            )
+
+            # Withdrawing one batch rechecks only dependent interpretations,
+            # and a partial withdrawal removes just the appended interval.
+            self.assertEqual(
+                v7["supplement_dependent_candidates"],
                 ["candidate_supplement_assisted_p1_right_hand"],
             )
             self.assertEqual(
-                v6["supplement_dependent_schemes"],
+                v7["supplement_dependent_schemes"],
                 ["scheme_004_supplement_assisted"],
             )
             self.assertEqual(
-                v6["contact_dependent_candidates"],
+                v7["contact_dependent_candidates"],
                 ["candidate_no_swap_keep_observed_labels"],
             )
             withdrawn = {
                 item["batch_id"]: item
-                for item in v6["supplement_review"]["batch_results"]
+                for item in v7["supplement_review"]["batch_results"]
             }
             self.assertEqual(
                 withdrawn["supplement_002_conflicting_remeasure"]["status"],
@@ -970,8 +1056,23 @@ class PlatformIntegrationTest(unittest.TestCase):
                 [],
             )
             self.assertEqual(
-                withdrawn["supplement_001_two_hand_remeasure"]["supported_frames"],
+                withdrawn["supplement_001_object_only_remeasure"]["supported_frames"],
                 [22, 23],
+            )
+            # The partially withdrawn frame 27 falls back to pending; the
+            # grasp frames stay supported by the remaining adoption.
+            review7 = v7["supplement_review"]
+            self.assertEqual(
+                review7["supported_intervals"],
+                [{"start_frame": 22, "end_frame": 23}],
+            )
+            self.assertEqual(
+                review7["pending_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
+            )
+            self.assertEqual(
+                review7["still_missing_intervals"],
+                [{"start_frame": 28, "end_frame": 28}],
             )
 
             # Reopened persistence and per-frame export traceability.
@@ -980,15 +1081,19 @@ class PlatformIntegrationTest(unittest.TestCase):
                 for item in store.load_supplements(action, pipeline)
             }
             self.assertEqual(
-                stored["supplement_001_two_hand_remeasure"]["status"],
+                stored["supplement_001_object_only_remeasure"]["status"],
                 "partially_adopted",
             )
             self.assertEqual(
-                stored["supplement_001_two_hand_remeasure"]["adopted_intervals"],
+                stored["supplement_001_object_only_remeasure"]["adopted_intervals"],
                 [{"start_frame": 22, "end_frame": 23}],
             )
             self.assertEqual(
                 stored["supplement_002_conflicting_remeasure"]["status"], "withdrawn"
+            )
+            self.assertEqual(
+                stored["supplement_003_ankle_only_remeasure"]["adopted_intervals"],
+                [{"start_frame": 27, "end_frame": 27}],
             )
 
             export = json.loads(
@@ -997,26 +1102,31 @@ class PlatformIntegrationTest(unittest.TestCase):
             exported = {
                 item["batch_id"]: item for item in export["supplementary_batches"]
             }
-            primary_export = exported["supplement_001_two_hand_remeasure"]
-            self.assertEqual(primary_export["status"], "partially_adopted")
+            object_only_export = exported["supplement_001_object_only_remeasure"]
+            self.assertEqual(object_only_export["status"], "partially_adopted")
             self.assertEqual(
-                primary_export["adopted_intervals"],
+                object_only_export["adopted_intervals"],
                 [{"start_frame": 22, "end_frame": 23}],
             )
-            self.assertIn("p0_l_wrist", primary_export["tracks"])
+            self.assertIn("object", object_only_export["tracks"])
             evidence_frames = {
-                (item["frame"], item["batch_id"], item["body_target"])
-                for item in primary_export["frame_evidence"]
+                (item["frame"], item["batch_id"], item["body_source"])
+                for item in object_only_export["frame_evidence"]
             }
             self.assertEqual(
                 evidence_frames,
                 {
-                    (22, "supplement_001_two_hand_remeasure", "p1_r_wrist"),
-                    (23, "supplement_001_two_hand_remeasure", "p1_r_wrist"),
+                    (22, "supplement_001_object_only_remeasure", "raw_observation"),
+                    (23, "supplement_001_object_only_remeasure", "raw_observation"),
                 },
             )
-            self.assertEqual(len(export["supplement_conflicts"]), 2)
-            self.assertEqual(len(export["supplement_duplicate_adoptions"]), 2)
+            # The raw capture and the object track were never rewritten by
+            # the supplementary evidence.
+            self.assertEqual(
+                export["original_capture"]["observations"],
+                store.load_capture("demo_capture_0003")["observations"],
+            )
+            self.assertIsNone(export["object_tracks"]["ball_01"]["positions"][27])
 
 if __name__ == "__main__":
     unittest.main()
